@@ -11,7 +11,7 @@ from datetime import timedelta
 # ============================================
 # CONFIG
 # ============================================
-DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN", "MTUxMjAxOTAzOTc2ODE1NDEyMg.G-ZRVG.8FLd8Dvmg-XVys1WwFRJv5q2oRe7LZvVU9TrTo"
+DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN", "YOUR_TOKEN_HERE")
 FFMPEG_PATH = "/usr/bin/ffmpeg"
 DOWNLOAD_DIR = "/tmp/music_cache"
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
