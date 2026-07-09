@@ -1,74 +1,119 @@
-import discord
-from discord.ext import commands
-from discord import app_commands
-import yt_dlp
 import asyncio
-import time
+import logging
 import os
 import subprocess
+import sys
+import time
+import uuid
+from contextlib import suppress
 from datetime import timedelta
+from pathlib import Path
+
+import discord
+import yt_dlp
+from discord import app_commands
+from discord.ext import commands
 
 # ============================================
-# CONFIG
+# Config
 # ============================================
-DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN", "YOUR_TOKEN_HERE")
-FFMPEG_PATH = "/usr/bin/ffmpeg"
-DOWNLOAD_DIR = "/tmp/music_cache"
-os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
+FFMPEG_PATH = os.getenv("FFMPEG_PATH", "/usr/bin/ffmpeg")
+DOWNLOAD_DIR = Path(os.getenv("DOWNLOAD_DIR", "/tmp/music_cache"))
+
+if not DISCORD_TOKEN:
+    print("ERROR: DISCORD_TOKEN is missing.")
+    print("Set DISCORD_TOKEN in Railway Variables.")
+    sys.exit(1)
+
+DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
+# Keep logs low, but still show actual errors
+logging.basicConfig(
+    level=logging.WARNING,
+    format="%(levelname)s: %(message)s"
+)
+logger = logging.getLogger("musicbot")
+
+# Silence noisy libraries
+logging.getLogger("discord").setLevel(logging.ERROR)
+logging.getLogger("yt_dlp").setLevel(logging.ERROR)
 
 # ============================================
-# FFmpeg Check
+# FFmpeg check
 # ============================================
 def check_ffmpeg():
     try:
-        r = subprocess.run([FFMPEG_PATH, "-version"], capture_output=True)
-        if r.returncode == 0:
+        result = subprocess.run(
+            [FFMPEG_PATH, "-version"],
+            capture_output=True,
+            text=True
+        )
+        if result.returncode == 0:
+            print("FFmpeg: OK")
             return True
     except FileNotFoundError:
         pass
-    os.system("apt-get install -y ffmpeg > /dev/null 2>&1")
-    return True
 
-check_ffmpeg()
+    print("FFmpeg: Not found")
+    return False
+
+
+if not check_ffmpeg():
+    sys.exit(1)
 
 # ============================================
-# Bot Setup
+# Discord bot setup
 # ============================================
 intents = discord.Intents.default()
-intents.message_content = True
+intents.message_content = False
 intents.voice_states = True
 bot = commands.Bot(command_prefix="!", intents=intents)
+
+# ============================================
+# Runtime state
+# ============================================
 music_data = {}
+guild_locks = {}
+
+
+def get_guild_lock(guild_id: int) -> asyncio.Lock:
+    lock = guild_locks.get(guild_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        guild_locks[guild_id] = lock
+    return lock
+
+
+def cleanup_cache(max_age_seconds: int = 1800):
+    now = time.time()
+    for file in DOWNLOAD_DIR.iterdir():
+        if file.is_file():
+            with suppress(Exception):
+                if now - file.stat().st_mtime > max_age_seconds:
+                    file.unlink()
+
+
+def safe_remove(path: str | None):
+    if not path:
+        return
+    with suppress(Exception):
+        p = Path(path)
+        if p.exists():
+            p.unlink()
+
 
 # ============================================
-# Cleanup old cached files
+# YouTube search and local download
 # ============================================
-def cleanup_cache():
-    try:
-        now = time.time()
-        for f in os.listdir(DOWNLOAD_DIR):
-            fp = os.path.join(DOWNLOAD_DIR, f)
-            if os.path.isfile(fp):
-                if now - os.path.getmtime(fp) > 1800:
-                    os.remove(fp)
-    except Exception:
-        pass
-
-# ============================================
-# Search YouTube + Download Audio
-# ============================================
-def search_and_download(query):
+def search_and_download(query: str):
     cleanup_cache()
 
-    filename = os.path.join(
-        DOWNLOAD_DIR, f"song_{int(time.time())}"
-    )
+    base_name = f"song_{uuid.uuid4().hex}"
+    base_path = DOWNLOAD_DIR / base_name
 
     ydl_opts = {
-        "format": (
-            "bestaudio[ext=webm]/bestaudio[ext=m4a]/"
-            "bestaudio/best"
-        ),
+        "format": "bestaudio/best",
         "noplaylist": True,
         "quiet": True,
         "no_warnings": True,
@@ -78,7 +123,7 @@ def search_and_download(query):
         "source_address": "0.0.0.0",
         "socket_timeout": 30,
         "retries": 5,
-        "outtmpl": filename + ".%(ext)s",
+        "outtmpl": str(base_path) + ".%(ext)s",
         "postprocessors": [{
             "key": "FFmpegExtractAudio",
             "preferredcodec": "mp3",
@@ -95,28 +140,35 @@ def search_and_download(query):
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            result = ydl.extract_info(
-                f"ytsearch3:{query} official audio",
+            search_result = ydl.extract_info(
+                f"ytsearch5:{query} official audio",
                 download=False
             )
 
-            if not result or "entries" not in result:
+            if not search_result or "entries" not in search_result:
                 return None
 
-            entries = [e for e in result["entries"] if e]
+            entries = [e for e in search_result["entries"] if e]
             if not entries:
                 return None
 
             chosen = None
+            preferred_terms = (
+                "official audio",
+                "official video",
+                "official music video",
+                "audio",
+                "lyric video",
+                "full song",
+            )
+
             for entry in entries:
-                t = (entry.get("title") or "").lower()
-                if any(k in t for k in [
-                    "official audio", "official video",
-                    "full song", "audio"
-                ]):
+                title_lower = (entry.get("title") or "").lower()
+                if any(term in title_lower for term in preferred_terms):
                     chosen = entry
                     break
-            if not chosen:
+
+            if chosen is None:
                 chosen = entries[0]
 
             video_url = chosen.get("webpage_url") or chosen.get("url")
@@ -127,22 +179,33 @@ def search_and_download(query):
             if not info:
                 return None
 
-            mp3_file = filename + ".mp3"
-            if not os.path.exists(mp3_file):
-                for f in os.listdir(DOWNLOAD_DIR):
-                    if f.startswith(os.path.basename(filename)):
-                        mp3_file = os.path.join(DOWNLOAD_DIR, f)
+            downloaded_file = None
+            expected_mp3 = base_path.with_suffix(".mp3")
+            if expected_mp3.exists():
+                downloaded_file = expected_mp3
+            else:
+                candidates = sorted(
+                    DOWNLOAD_DIR.glob(base_name + ".*"),
+                    key=lambda p: p.stat().st_mtime,
+                    reverse=True
+                )
+                for candidate in candidates:
+                    if candidate.is_file():
+                        downloaded_file = candidate
                         break
 
-            if not os.path.exists(mp3_file):
+            if downloaded_file is None or not downloaded_file.exists():
                 return None
 
-            if os.path.getsize(mp3_file) < 10000:
-                os.remove(mp3_file)
+            if downloaded_file.stat().st_size < 10000:
+                safe_remove(str(downloaded_file))
                 return None
 
             title = info.get("title", "Unknown")
             uploader = info.get("uploader", "Unknown Artist")
+
+            song_name = title
+            artist_name = uploader
 
             if " - " in title:
                 parts = title.split(" - ", 1)
@@ -152,19 +215,18 @@ def search_and_download(query):
                 parts = title.split(" – ", 1)
                 song_name = parts[0].strip()
                 artist_name = parts[1].strip()
-            else:
-                song_name = title
-                artist_name = uploader
 
-            for tag in [
+            clean_tags = [
                 "(Official Audio)", "(Official Video)",
                 "(Official Music Video)", "[Official Audio]",
                 "[Official Video]", "(Lyric Video)",
                 "(Audio)", "(HD)", "(Full Song)",
                 "[Full Song]", "(Lyrics)", "[Lyrics]",
                 "(Official)", "[Official]",
-                "(Full Audio)", "[Full Audio]",
-            ]:
+                "(Full Audio)", "[Full Audio]"
+            ]
+
+            for tag in clean_tags:
                 song_name = song_name.replace(tag, "").strip()
                 artist_name = artist_name.replace(tag, "").strip()
 
@@ -173,408 +235,505 @@ def search_and_download(query):
             duration = info.get("duration") or 0
 
             return {
-                "name": song_name,
-                "artist": artist_name,
+                "name": song_name or title,
+                "artist": artist_name or uploader,
                 "album": "YouTube Music",
                 "duration_sec": duration,
                 "thumbnail": thumbnail,
-                "file_path": mp3_file,
+                "file_path": str(downloaded_file),
                 "title": title,
             }
 
-    except Exception:
+    except Exception as e:
+        logger.warning("Download failed: %s", e)
         return None
 
 
 # ============================================
-# Create Embed
+# Embed helpers
 # ============================================
-def create_embed(song, gid, status="playing"):
-    data = music_data.get(gid, {})
-    dur = max(song.get("duration_sec", 0), 1)
+def create_embed(song: dict, guild_id: int, status: str = "playing"):
+    data = music_data.get(guild_id, {})
+    duration = max(int(song.get("duration_sec", 0)), 1)
 
     if status == "playing" and "start_time" in data:
-        tp = data.get("total_paused", 0)
-        el = min(time.time() - data["start_time"] - tp, dur)
+        total_paused = data.get("total_paused", 0.0)
+        elapsed = min(time.time() - data["start_time"] - total_paused, duration)
     elif status == "paused" and data.get("pause_time"):
-        tp = data.get("total_paused", 0)
-        el = min(data["pause_time"] - data["start_time"] - tp, dur)
+        total_paused = data.get("total_paused", 0.0)
+        elapsed = min(data["pause_time"] - data["start_time"] - total_paused, duration)
     else:
-        el = 0
+        elapsed = 0
 
-    el = max(0, el)
-    rem = max(0, dur - el)
-    prog = min(el / dur, 1.0)
-    filled = int(20 * prog)
-    bar = "=" * filled + "-" * (20 - filled)
+    elapsed = max(0, int(elapsed))
+    remaining = max(0, duration - elapsed)
+    progress_ratio = min(elapsed / duration, 1.0)
+    filled = int(20 * progress_ratio)
+    bar = "█" * filled + "─" * (20 - filled)
 
     colors = {
         "playing": discord.Color.green(),
         "paused": discord.Color.yellow(),
         "stopped": discord.Color.red(),
+        "finished": discord.Color.blue(),
     }
-    emojis = {
+
+    statuses = {
         "playing": "Now Playing",
         "paused": "Paused",
         "stopped": "Stopped",
+        "finished": "Finished",
     }
 
-    em = discord.Embed(
+    embed = discord.Embed(
         title="Music Player",
         color=colors.get(status, discord.Color.blue())
     )
-    em.add_field(
-        name="Song", value=f"**{song['name']}**", inline=False
-    )
-    em.add_field(name="Artist", value=song["artist"], inline=True)
-    em.add_field(
-        name="Album", value=song.get("album", "YT"), inline=True
-    )
-    em.add_field(
-        name="Status",
-        value=emojis.get(status, "Unknown"),
-        inline=True
-    )
-    em.add_field(
+    embed.add_field(name="Song", value=f"**{song['name']}**", inline=False)
+    embed.add_field(name="Artist", value=song["artist"], inline=True)
+    embed.add_field(name="Album", value=song.get("album", "Unknown"), inline=True)
+    embed.add_field(name="Status", value=statuses.get(status, "Unknown"), inline=True)
+    embed.add_field(
         name="Progress",
         value=(
-            f"`{timedelta(seconds=int(el))}` [{bar}] "
-            f"`{timedelta(seconds=int(dur))}`"
+            f"`{timedelta(seconds=elapsed)}` "
+            f"{bar} "
+            f"`{timedelta(seconds=duration)}`"
         ),
         inline=False
     )
-    em.add_field(
+    embed.add_field(
         name="Remaining",
-        value=f"**{timedelta(seconds=int(rem))}**",
+        value=f"**{timedelta(seconds=remaining)}**",
         inline=True
     )
+
     if song.get("thumbnail"):
-        em.set_thumbnail(url=song["thumbnail"])
-    em.set_footer(text="Music Bot | /song to play")
-    return em
+        embed.set_thumbnail(url=song["thumbnail"])
+
+    embed.set_footer(text="Music Bot | Use /song to play")
+    return embed
+
+
+async def safe_edit_message(message: discord.Message, **kwargs):
+    with suppress(Exception):
+        await message.edit(**kwargs)
 
 
 # ============================================
-# Music Controls View
+# Session helpers
+# ============================================
+async def stop_current_session(guild_id: int, disconnect: bool):
+    data = music_data.pop(guild_id, None)
+    if not data:
+        return None
+
+    vc = data.get("vc")
+    file_path = data.get("song_info", {}).get("file_path")
+
+    if vc:
+        with suppress(Exception):
+            if vc.is_playing() or vc.is_paused():
+                vc.stop()
+
+        if disconnect:
+            with suppress(Exception):
+                if vc.is_connected():
+                    await vc.disconnect()
+
+    safe_remove(file_path)
+    return data
+
+
+async def handle_track_end(guild_id: int, session_id: str, error: Exception | None):
+    async with get_guild_lock(guild_id):
+        data = music_data.get(guild_id)
+        if not data:
+            return
+
+        if data.get("session_id") != session_id:
+            return
+
+        song = data.get("song_info")
+        vc = data.get("vc")
+        msg = data.get("message")
+        file_path = song.get("file_path") if song else None
+
+        music_data.pop(guild_id, None)
+
+        if vc:
+            with suppress(Exception):
+                if vc.is_connected():
+                    await vc.disconnect()
+
+        safe_remove(file_path)
+
+        if error:
+            embed = discord.Embed(
+                title="Playback Error",
+                description="The track stopped because of an internal playback error.",
+                color=discord.Color.red()
+            )
+        else:
+            embed = discord.Embed(
+                title="Song Finished",
+                color=discord.Color.blue()
+            )
+            if song:
+                embed.add_field(name="Song", value=f"**{song['name']}**", inline=True)
+                embed.add_field(name="Artist", value=song["artist"], inline=True)
+                if song.get("thumbnail"):
+                    embed.set_thumbnail(url=song["thumbnail"])
+            embed.set_footer(text="Use /song to play another track")
+
+        if msg:
+            await safe_edit_message(msg, embed=embed, view=discord.ui.View())
+
+
+# ============================================
+# Audio source
+# ============================================
+def build_source(file_path: str):
+    return discord.PCMVolumeTransformer(
+        discord.FFmpegPCMAudio(
+            file_path,
+            executable=FFMPEG_PATH,
+            before_options="-nostdin",
+            options="-vn -sn -dn -ar 48000 -ac 2"
+        ),
+        volume=0.7
+    )
+
+
+# ============================================
+# Controls view
 # ============================================
 class Controls(discord.ui.View):
-    def __init__(self, song, gid):
+    def __init__(self, song: dict, guild_id: int):
         super().__init__(timeout=None)
         self.song = song
-        self.gid = gid
+        self.guild_id = guild_id
 
     @discord.ui.button(
-        label="Pause", emoji="⏸️",
+        label="Pause",
+        emoji="⏸️",
         style=discord.ButtonStyle.primary,
-        custom_id="btn_pause"
+        custom_id="music_pause"
     )
-    async def pause(self, inter, btn):
-        d = music_data.get(self.gid)
-        if not d or not d.get("vc"):
-            return await inter.response.send_message(
-                "Not playing!", ephemeral=True
-            )
-        vc = d["vc"]
-        if vc.is_playing():
+    async def pause_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        async with get_guild_lock(self.guild_id):
+            data = music_data.get(self.guild_id)
+            if not data or not data.get("vc"):
+                await interaction.response.send_message("Nothing is playing.", ephemeral=True)
+                return
+
+            vc = data["vc"]
+            if not vc.is_playing():
+                await interaction.response.send_message("Playback is already paused.", ephemeral=True)
+                return
+
             vc.pause()
-            d["is_paused"] = True
-            d["pause_time"] = time.time()
-            await inter.response.edit_message(
-                embed=create_embed(self.song, self.gid, "paused"),
+            data["is_paused"] = True
+            data["pause_time"] = time.time()
+
+            await interaction.response.edit_message(
+                embed=create_embed(self.song, self.guild_id, "paused"),
                 view=self
-            )
-        else:
-            await inter.response.send_message(
-                "Already paused!", ephemeral=True
             )
 
     @discord.ui.button(
-        label="Resume", emoji="▶️",
+        label="Resume",
+        emoji="▶️",
         style=discord.ButtonStyle.success,
-        custom_id="btn_resume"
+        custom_id="music_resume"
     )
-    async def resume(self, inter, btn):
-        d = music_data.get(self.gid)
-        if not d or not d.get("vc"):
-            return await inter.response.send_message(
-                "Not playing!", ephemeral=True
-            )
-        vc = d["vc"]
-        if vc.is_paused():
-            if d.get("pause_time"):
-                d["total_paused"] = (
-                    d.get("total_paused", 0) +
-                    time.time() - d["pause_time"]
-                )
-                d["pause_time"] = None
+    async def resume_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        async with get_guild_lock(self.guild_id):
+            data = music_data.get(self.guild_id)
+            if not data or not data.get("vc"):
+                await interaction.response.send_message("Nothing is playing.", ephemeral=True)
+                return
+
+            vc = data["vc"]
+            if not vc.is_paused():
+                await interaction.response.send_message("Playback is already running.", ephemeral=True)
+                return
+
+            if data.get("pause_time"):
+                paused_duration = time.time() - data["pause_time"]
+                data["total_paused"] = data.get("total_paused", 0.0) + paused_duration
+                data["pause_time"] = None
+
             vc.resume()
-            d["is_paused"] = False
-            await inter.response.edit_message(
-                embed=create_embed(self.song, self.gid, "playing"),
+            data["is_paused"] = False
+
+            await interaction.response.edit_message(
+                embed=create_embed(self.song, self.guild_id, "playing"),
                 view=self
             )
-        else:
-            await inter.response.send_message(
-                "Already playing!", ephemeral=True
-            )
 
     @discord.ui.button(
-        label="Stop", emoji="⏹️",
+        label="Stop",
+        emoji="⏹️",
         style=discord.ButtonStyle.danger,
-        custom_id="btn_stop"
+        custom_id="music_stop"
     )
-    async def stop_btn(self, inter, btn):
-        d = music_data.get(self.gid)
-        if not d or not d.get("vc"):
-            return await inter.response.send_message(
-                "Not playing!", ephemeral=True
+    async def stop_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        async with get_guild_lock(self.guild_id):
+            data = music_data.get(self.guild_id)
+            if not data:
+                await interaction.response.send_message("Nothing is playing.", ephemeral=True)
+                return
+
+            await stop_current_session(self.guild_id, disconnect=True)
+
+            for child in self.children:
+                child.disabled = True
+
+            await interaction.response.edit_message(
+                embed=create_embed(self.song, self.guild_id, "stopped"),
+                view=self
             )
-        vc = d["vc"]
-        d["user_stop"] = True
-        if vc.is_playing() or vc.is_paused():
-            vc.stop()
-        if vc.is_connected():
-            await vc.disconnect()
-
-        fp = d.get("song_info", {}).get("file_path")
-        if fp and os.path.exists(fp):
-            try:
-                os.remove(fp)
-            except Exception:
-                pass
-
-        for c in self.children:
-            c.disabled = True
-        await inter.response.edit_message(
-            embed=create_embed(self.song, self.gid, "stopped"),
-            view=self
-        )
-        if self.gid in music_data:
-            del music_data[self.gid]
 
     @discord.ui.button(
-        label="New Song", emoji="⏭️",
+        label="New Song",
+        emoji="⏭️",
         style=discord.ButtonStyle.secondary,
-        custom_id="btn_new"
+        custom_id="music_new_song"
     )
-    async def new_song(self, inter, btn):
-        await inter.response.send_modal(SongModal(self.gid))
+    async def new_song_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(NewSongModal(self.guild_id))
 
 
 # ============================================
-# New Song Modal
+# Modal
 # ============================================
-class SongModal(discord.ui.Modal, title="Play New Song"):
-    inp = discord.ui.TextInput(
+class NewSongModal(discord.ui.Modal, title="Play New Song"):
+    song_name = discord.ui.TextInput(
         label="Song Name",
-        placeholder="Enter song name here...",
+        placeholder="Enter a song name...",
         required=True,
         max_length=200
     )
 
-    def __init__(self, gid):
+    def __init__(self, guild_id: int):
         super().__init__()
-        self.gid = gid
+        self.guild_id = guild_id
 
-    async def on_submit(self, inter):
-        await inter.response.defer(thinking=True)
-        d = music_data.get(self.gid)
-        if not d or not d.get("vc"):
-            return await inter.followup.send("Use /song first!")
-        vc = d["vc"]
-        d["user_stop"] = True
-        if vc.is_playing() or vc.is_paused():
-            vc.stop()
-        await asyncio.sleep(0.5)
-        await play_song(inter, self.inp.value, vc)
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(thinking=True)
 
+        data = music_data.get(self.guild_id)
+        voice_channel = None
 
-# ============================================
-# Main Play Function
-# ============================================
-async def play_song(inter, query, vc):
-    gid = inter.guild.id
+        if data and data.get("vc") and data["vc"].channel:
+            voice_channel = data["vc"].channel
+        elif interaction.user.voice and interaction.user.voice.channel:
+            voice_channel = interaction.user.voice.channel
 
-    msg = await inter.followup.send(
-        embed=discord.Embed(
-            title="Searching & Downloading...",
-            description=f"```{query}```\nPlease wait...",
-            color=discord.Color.blue()
-        )
-    )
+        if voice_channel is None:
+            await interaction.followup.send("Bot is not connected to a voice channel.", ephemeral=True)
+            return
 
-    loop = asyncio.get_event_loop()
-    song = await loop.run_in_executor(
-        None, search_and_download, query
-    )
-
-    if not song:
-        return await msg.edit(
-            embed=discord.Embed(
-                title="Not Found!",
-                description=f"**{query}** was not found. Try another name.",
-                color=discord.Color.red()
-            )
-        )
-
-    await msg.edit(
-        embed=discord.Embed(
-            title="Starting playback...",
-            description=f"**{song['name']}** - {song['artist']}",
-            color=discord.Color.blue()
-        )
-    )
-
-    try:
-        source = discord.FFmpegPCMAudio(
-            song["file_path"],
-            executable=FFMPEG_PATH,
-            options="-vn -ar 48000 -ac 2"
-        )
-        source = discord.PCMVolumeTransformer(source, volume=0.7)
-    except Exception as e:
-        return await msg.edit(
-            embed=discord.Embed(
-                title="Audio Error",
-                description=f"`{e}`",
-                color=discord.Color.red()
-            )
-        )
-
-    music_data[gid] = {
-        "vc": vc,
-        "song_info": song,
-        "is_paused": False,
-        "start_time": time.time(),
-        "pause_time": None,
-        "total_paused": 0,
-        "message": msg,
-        "user_stop": False,
-    }
-
-    def after(err):
-        asyncio.run_coroutine_threadsafe(on_end(gid), bot.loop)
-
-    try:
-        if vc.is_playing() or vc.is_paused():
-            vc.stop()
-            await asyncio.sleep(0.3)
-        vc.play(source, after=after)
-    except Exception as e:
-        return await msg.edit(
-            embed=discord.Embed(
-                title="Play Error",
-                description=f"`{e}`",
-                color=discord.Color.red()
-            )
-        )
-
-    await asyncio.sleep(1)
-    if not vc.is_playing() and not vc.is_paused():
-        if gid in music_data:
-            del music_data[gid]
-        return await msg.edit(
-            embed=discord.Embed(
-                title="Playback Failed!",
-                description="Could not play this song. Try another one.",
-                color=discord.Color.red()
-            )
-        )
-
-    view = Controls(song, gid)
-    await msg.edit(
-        embed=create_embed(song, gid, "playing"),
-        view=view
-    )
-
-    bot.loop.create_task(updater(gid, song, view, msg))
+        await play_song(interaction, self.song_name.value, voice_channel)
 
 
 # ============================================
-# Embed Auto Updater
+# Main play workflow
 # ============================================
-async def updater(gid, song, view, msg):
-    await asyncio.sleep(10)
-    while gid in music_data:
-        d = music_data.get(gid)
-        if not d:
-            break
-        vc = d.get("vc")
-        if not vc or (not vc.is_playing() and not vc.is_paused()):
-            break
-        st = "paused" if d.get("is_paused") else "playing"
+async def play_song(interaction: discord.Interaction, query: str, voice_channel: discord.VoiceChannel):
+    guild = interaction.guild
+    if guild is None:
+        await interaction.followup.send("This command can only be used in a server.", ephemeral=True)
+        return
+
+    guild_id = guild.id
+
+    async with get_guild_lock(guild_id):
+        status_message = await interaction.followup.send(
+            embed=discord.Embed(
+                title="Searching and Downloading",
+                description=f"```{query}```\nPlease wait...",
+                color=discord.Color.blue()
+            )
+        )
+
+        await stop_current_session(guild_id, disconnect=False)
+
         try:
-            await msg.edit(
-                embed=create_embed(song, gid, st), view=view
+            current_vc = guild.voice_client
+            if current_vc and current_vc.is_connected():
+                if current_vc.channel != voice_channel:
+                    await current_vc.move_to(voice_channel)
+                vc = current_vc
+            else:
+                vc = await voice_channel.connect(timeout=30.0, self_deaf=True)
+        except Exception as e:
+            await safe_edit_message(
+                status_message,
+                embed=discord.Embed(
+                    title="Voice Connection Error",
+                    description=f"`{e}`",
+                    color=discord.Color.red()
+                )
+            )
+            return
+
+        loop = asyncio.get_running_loop()
+        song = await loop.run_in_executor(None, search_and_download, query)
+
+        if not song:
+            await safe_edit_message(
+                status_message,
+                embed=discord.Embed(
+                    title="Song Not Found",
+                    description="Could not find or download that song. Try another query.",
+                    color=discord.Color.red()
+                )
+            )
+            return
+
+        try:
+            source = build_source(song["file_path"])
+        except Exception as e:
+            safe_remove(song.get("file_path"))
+            await safe_edit_message(
+                status_message,
+                embed=discord.Embed(
+                    title="Audio Source Error",
+                    description=f"`{e}`",
+                    color=discord.Color.red()
+                )
+            )
+            return
+
+        session_id = uuid.uuid4().hex
+
+        music_data[guild_id] = {
+            "session_id": session_id,
+            "vc": vc,
+            "song_info": song,
+            "is_paused": False,
+            "start_time": time.time(),
+            "pause_time": None,
+            "total_paused": 0.0,
+            "message": status_message,
+        }
+
+        def after_playback(error):
+            asyncio.run_coroutine_threadsafe(
+                handle_track_end(guild_id, session_id, error),
+                bot.loop
+            )
+
+        try:
+            if vc.is_playing() or vc.is_paused():
+                vc.stop()
+                await asyncio.sleep(0.2)
+
+            vc.play(source, after=after_playback)
+        except Exception as e:
+            current = music_data.get(guild_id)
+            if current and current.get("session_id") == session_id:
+                music_data.pop(guild_id, None)
+            safe_remove(song.get("file_path"))
+
+            await safe_edit_message(
+                status_message,
+                embed=discord.Embed(
+                    title="Playback Error",
+                    description=f"`{e}`",
+                    color=discord.Color.red()
+                )
+            )
+            return
+
+        await asyncio.sleep(1.0)
+
+        current = music_data.get(guild_id)
+        if not current or current.get("session_id") != session_id:
+            return
+
+        if not vc.is_playing() and not vc.is_paused():
+            music_data.pop(guild_id, None)
+            safe_remove(song.get("file_path"))
+
+            with suppress(Exception):
+                if vc.is_connected():
+                    await vc.disconnect()
+
+            await safe_edit_message(
+                status_message,
+                embed=discord.Embed(
+                    title="Playback Failed",
+                    description="The file was downloaded, but playback could not start.",
+                    color=discord.Color.red()
+                )
+            )
+            return
+
+        view = Controls(song, guild_id)
+        await safe_edit_message(
+            status_message,
+            embed=create_embed(song, guild_id, "playing"),
+            view=view
+        )
+
+        bot.loop.create_task(embed_updater(guild_id, session_id, song, view, status_message))
+
+
+# ============================================
+# Embed updater
+# ============================================
+async def embed_updater(
+    guild_id: int,
+    session_id: str,
+    song: dict,
+    view: discord.ui.View,
+    message: discord.Message
+):
+    await asyncio.sleep(10)
+
+    while True:
+        data = music_data.get(guild_id)
+        if not data:
+            break
+
+        if data.get("session_id") != session_id:
+            break
+
+        vc = data.get("vc")
+        if vc is None:
+            break
+
+        if not vc.is_playing() and not vc.is_paused():
+            break
+
+        status = "paused" if data.get("is_paused") else "playing"
+
+        try:
+            await message.edit(
+                embed=create_embed(song, guild_id, status),
+                view=view
             )
         except Exception:
             break
+
         await asyncio.sleep(20)
 
 
 # ============================================
-# Song End Handler
-# ============================================
-async def on_end(gid):
-    d = music_data.get(gid)
-    if not d:
-        return
-    if d.get("user_stop"):
-        return
-
-    vc = d.get("vc")
-    msg = d.get("message")
-    song = d.get("song_info")
-
-    if vc and vc.is_connected():
-        try:
-            await vc.disconnect()
-        except Exception:
-            pass
-
-    if song and song.get("file_path"):
-        try:
-            if os.path.exists(song["file_path"]):
-                os.remove(song["file_path"])
-        except Exception:
-            pass
-
-    if msg and song:
-        try:
-            em = discord.Embed(
-                title="Song Finished!",
-                color=discord.Color.blue()
-            )
-            em.add_field(
-                name="Song",
-                value=f"**{song['name']}**",
-                inline=True
-            )
-            em.add_field(
-                name="Artist", value=song["artist"], inline=True
-            )
-            if song.get("thumbnail"):
-                em.set_thumbnail(url=song["thumbnail"])
-            em.set_footer(text="Use /song to play another!")
-            await msg.edit(embed=em, view=discord.ui.View())
-        except Exception:
-            pass
-
-    if gid in music_data:
-        del music_data[gid]
-
-
-# ============================================
-# Bot Ready Event
+# Events
 # ============================================
 @bot.event
 async def on_ready():
-    print(f"Bot Online: {bot.user.name} ({bot.user.id})")
+    print(f"Bot Online: {bot.user} ({bot.user.id})")
     try:
-        s = await bot.tree.sync()
-        print(f"Synced {len(s)} commands")
-    except Exception:
-        pass
+        synced = await bot.tree.sync()
+        print(f"Synced {len(synced)} commands")
+    except Exception as e:
+        logger.warning("Command sync failed: %s", e)
+
     await bot.change_presence(
         activity=discord.Activity(
             type=discord.ActivityType.listening,
@@ -583,101 +742,91 @@ async def on_ready():
     )
 
 
-# ============================================
-# /song Command
-# ============================================
-@bot.tree.command(name="song", description="Play a song in voice channel!")
-@app_commands.describe(name="Enter the song name")
-async def song_cmd(inter, name: str):
-    if not inter.user.voice:
-        return await inter.response.send_message(
-            embed=discord.Embed(
-                title="Join a Voice Channel first!",
-                color=discord.Color.red()
-            ),
-            ephemeral=True
-        )
+@bot.tree.error
+async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    original = getattr(error, "original", error)
+    logger.error("App command error: %s: %s", type(original).__name__, original)
 
-    vc_ch = inter.user.voice.channel
-    gid = inter.guild.id
-    await inter.response.defer(thinking=True)
+    message = "An internal error occurred while processing the command."
+    if isinstance(original, discord.Forbidden):
+        message = "Missing permission to perform that action."
+    elif isinstance(original, asyncio.TimeoutError):
+        message = "The operation timed out. Please try again."
 
-    if gid in music_data:
-        old = music_data[gid]
-        old["user_stop"] = True
-        ovc = old.get("vc")
-        if ovc:
-            try:
-                if ovc.is_playing() or ovc.is_paused():
-                    ovc.stop()
-                await asyncio.sleep(0.3)
-                if ovc.is_connected():
-                    await ovc.disconnect()
-                await asyncio.sleep(0.3)
-            except Exception:
-                pass
-
-        old_fp = old.get("song_info", {}).get("file_path")
-        if old_fp and os.path.exists(old_fp):
-            try:
-                os.remove(old_fp)
-            except Exception:
-                pass
-        del music_data[gid]
-
-    try:
-        ex = inter.guild.voice_client
-        if ex and ex.is_connected():
-            await ex.move_to(vc_ch)
-            vc = ex
+    with suppress(Exception):
+        if interaction.response.is_done():
+            await interaction.followup.send(message, ephemeral=True)
         else:
-            vc = await vc_ch.connect(
-                timeout=30.0, reconnect=True, self_deaf=True
-            )
-    except Exception as e:
-        return await inter.followup.send(f"VC Error: `{e}`")
-
-    await play_song(inter, name, vc)
+            await interaction.response.send_message(message, ephemeral=True)
 
 
 # ============================================
-# /stop Command
+# Commands
 # ============================================
-@bot.tree.command(name="stop", description="Stop music and disconnect")
-async def stop_cmd(inter):
-    gid = inter.guild.id
-    d = music_data.get(gid)
-    if not d or not d.get("vc"):
-        return await inter.response.send_message(
-            "Nothing is playing!", ephemeral=True
-        )
-    vc = d["vc"]
-    d["user_stop"] = True
+@bot.tree.command(name="song", description="Play a song in your voice channel")
+@app_commands.describe(name="Enter the song name")
+async def song_command(interaction: discord.Interaction, name: str):
     try:
-        if vc.is_playing() or vc.is_paused():
-            vc.stop()
-        if vc.is_connected():
-            await vc.disconnect()
-    except Exception:
-        pass
+        if interaction.guild is None:
+            await interaction.response.send_message(
+                "This command can only be used inside a server.",
+                ephemeral=True
+            )
+            return
 
-    fp = d.get("song_info", {}).get("file_path")
-    if fp and os.path.exists(fp):
-        try:
-            os.remove(fp)
-        except Exception:
-            pass
+        if not interaction.user.voice or not interaction.user.voice.channel:
+            await interaction.response.send_message(
+                embed=discord.Embed(
+                    title="Join a Voice Channel First",
+                    color=discord.Color.red()
+                ),
+                ephemeral=True
+            )
+            return
 
-    if gid in music_data:
-        del music_data[gid]
-    await inter.response.send_message(
-        embed=discord.Embed(
-            title="Stopped!", color=discord.Color.red()
-        )
-    )
+        await interaction.response.defer(thinking=True)
+        await play_song(interaction, name, interaction.user.voice.channel)
+
+    except Exception as e:
+        logger.error("song command failed: %s: %s", type(e).__name__, e)
+        raise
+
+
+@bot.tree.command(name="stop", description="Stop playback and disconnect the bot")
+async def stop_command(interaction: discord.Interaction):
+    try:
+        if interaction.guild is None:
+            await interaction.response.send_message(
+                "This command can only be used inside a server.",
+                ephemeral=True
+            )
+            return
+
+        guild_id = interaction.guild.id
+
+        async with get_guild_lock(guild_id):
+            data = music_data.get(guild_id)
+            if not data:
+                await interaction.response.send_message("Nothing is playing.", ephemeral=True)
+                return
+
+            await stop_current_session(guild_id, disconnect=True)
+
+            await interaction.response.send_message(
+                embed=discord.Embed(
+                    title="Stopped",
+                    description="Playback stopped and bot disconnected.",
+                    color=discord.Color.red()
+                )
+            )
+
+    except Exception as e:
+        logger.error("stop command failed: %s: %s", type(e).__name__, e)
+        raise
 
 
 # ============================================
-# Start Bot
+# Start bot
 # ============================================
-bot.run(DISCORD_TOKEN, log_level=40)
+print("Starting bot...")
+bot.run(DISCORD_TOKEN, log_level=logging.ERROR)
