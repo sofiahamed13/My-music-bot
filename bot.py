@@ -16,44 +16,102 @@ from discord import app_commands
 from discord.ext import commands
 
 # ============================================
+# Emoji Config - Change these to custom animated emojis later
+# Example: EMOJI_PLAY = "<a:play:123456789>"
+# ============================================
+EMOJI_PLAY = "▶️"
+EMOJI_PAUSE = "⏸️"
+EMOJI_STOP = "⏹️"
+EMOJI_SKIP = "⏭️"
+EMOJI_SEARCH = "🔍"
+EMOJI_MUSIC = "🎵"
+EMOJI_ARTIST = "🎤"
+EMOJI_TIME = "⏱️"
+EMOJI_LIST = "📜"
+EMOJI_ADD = "✅"
+EMOJI_REMOVE = "🗑️"
+EMOJI_CANCEL = "❌"
+EMOJI_FOLDER = "📁"
+EMOJI_DOT_GREEN = "🟢"
+EMOJI_DOT_YELLOW = "🟡"
+EMOJI_DOT_RED = "🔴"
+EMOJI_SPEAKER = "🔇"
+EMOJI_SHUFFLE = "🔀"
+EMOJI_FORWARD = "▶"
+EMOJI_BACKWARD = "◀"
+EMOJI_HEADPHONE = "🎧"
+EMOJI_LOADING = "⏳"
+EMOJI_CHECK = "☑️"
+EMOJI_STAR = "⭐"
+EMOJI_NEW = "🆕"
+EMOJI_WARN = "⚠️"
+EMOJI_LINK = "🔗"
+EMOJI_USER = "👤"
+EMOJI_COUNT = "🔢"
+EMOJI_PLAYLIST = "📋"
+
+# ============================================
 # Config
 # ============================================
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
 FFMPEG_PATH = os.getenv("FFMPEG_PATH", "/usr/bin/ffmpeg")
-PLAYLIST_FILE = Path(os.getenv("PLAYLIST_FILE", "/tmp/playlist_data.json"))
+DATA_FILE = Path(os.getenv("DATA_FILE", "/tmp/playlists.json"))
 
 if not DISCORD_TOKEN:
     print("ERROR: DISCORD_TOKEN missing.")
     sys.exit(1)
 
 logging.basicConfig(level=logging.ERROR, format="%(levelname)s: %(message)s")
-logger = logging.getLogger("musicbot")
 logging.getLogger("discord").setLevel(logging.ERROR)
 logging.getLogger("yt_dlp").setLevel(logging.ERROR)
 
 # ============================================
-# Playlist persistence
+# Data persistence - Multi playlist
 # ============================================
-def load_playlists() -> dict:
-    if PLAYLIST_FILE.exists():
+# Structure: { "guild_id": { "playlist_name": ["song1", "song2"], ... } }
+def load_data() -> dict:
+    if DATA_FILE.exists():
         with suppress(Exception):
-            with open(PLAYLIST_FILE, "r", encoding="utf-8") as f:
+            with open(DATA_FILE, "r", encoding="utf-8") as f:
                 return json.load(f)
     return {}
 
-def save_playlists(data: dict):
+def save_data(data: dict):
     with suppress(Exception):
-        with open(PLAYLIST_FILE, "w", encoding="utf-8") as f:
+        with open(DATA_FILE, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
 
-playlists = load_playlists()
+all_data = load_data()
 
-def get_guild_playlist(gid: int) -> list:
-    return playlists.setdefault(str(gid), [])
+def get_guild_data(gid: int) -> dict:
+    return all_data.setdefault(str(gid), {})
 
-def save_guild_playlist(gid: int, pl: list):
-    playlists[str(gid)] = pl
-    save_playlists(playlists)
+def get_playlist(gid: int, name: str) -> list:
+    gd = get_guild_data(gid)
+    return gd.get(name, [])
+
+def save_playlist(gid: int, name: str, songs: list):
+    gd = get_guild_data(gid)
+    gd[name] = songs
+    all_data[str(gid)] = gd
+    save_data(all_data)
+
+def delete_playlist(gid: int, name: str):
+    gd = get_guild_data(gid)
+    gd.pop(name, None)
+    all_data[str(gid)] = gd
+    save_data(all_data)
+
+def get_all_playlist_names(gid: int) -> list:
+    return list(get_guild_data(gid).keys())
+
+def get_default_playlist(gid: int) -> tuple:
+    """Get first available playlist for auto-play."""
+    gd = get_guild_data(gid)
+    for name, songs in gd.items():
+        if songs:
+            return name, songs
+    return None, []
 
 # ============================================
 # Bot setup
@@ -72,34 +130,15 @@ def get_lock(gid: int) -> asyncio.Lock:
     return guild_locks[gid]
 
 # ============================================
-# yt-dlp: Fast URL extraction (NO download)
+# yt-dlp extraction (no download - stream URL)
 # ============================================
-YDL_SEARCH_OPTS = {
-    "format": "bestaudio/best",
-    "noplaylist": True,
-    "quiet": True,
-    "no_warnings": True,
-    "nocheckcertificate": True,
-    "geo_bypass": True,
-    "source_address": "0.0.0.0",
-    "socket_timeout": 15,
-    "extract_flat": False,
-    "skip_download": True,
-    "extractor_args": {
-        "youtube": {
-            "player_client": ["web", "android"],
-        }
-    },
-    "http_headers": {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/126.0.0.0 Safari/537.36"
-        ),
-    },
-}
+FALLBACK_CLIENTS = [
+    {"youtube": {"player_client": ["web", "android"]}},
+    {"youtube": {"player_client": ["mediaconnect"]}},
+    {"youtube": {"player_client": ["tv_embedded"]}},
+]
 
-YDL_EXTRACT_OPTS = {
+BASE_YDL_OPTS = {
     "format": "bestaudio[ext=webm]/bestaudio/best",
     "noplaylist": True,
     "quiet": True,
@@ -108,11 +147,6 @@ YDL_EXTRACT_OPTS = {
     "geo_bypass": True,
     "source_address": "0.0.0.0",
     "socket_timeout": 15,
-    "extractor_args": {
-        "youtube": {
-            "player_client": ["web", "android"],
-        }
-    },
     "http_headers": {
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -122,24 +156,19 @@ YDL_EXTRACT_OPTS = {
     },
 }
 
-FALLBACK_CLIENTS = [
-    {"youtube": {"player_client": ["web", "android"]}},
-    {"youtube": {"player_client": ["mediaconnect"]}},
-    {"youtube": {"player_client": ["tv_embedded"]}},
-]
+
+def is_url(text: str) -> bool:
+    return text.startswith("http://") or text.startswith("https://")
 
 
 def extract_song_url(query: str) -> dict | None:
-    """Search + extract stream URL without downloading. Fast."""
-    is_url = query.startswith("http://") or query.startswith("https://")
-
-    for i, client_args in enumerate(FALLBACK_CLIENTS):
+    for client_args in FALLBACK_CLIENTS:
         try:
-            opts = dict(YDL_EXTRACT_OPTS)
+            opts = dict(BASE_YDL_OPTS)
             opts["extractor_args"] = client_args
 
             with yt_dlp.YoutubeDL(opts) as ydl:
-                if is_url:
+                if is_url(query):
                     info = ydl.extract_info(query, download=False)
                 else:
                     info = ydl.extract_info(f"ytsearch1:{query}", download=False)
@@ -154,56 +183,60 @@ def extract_song_url(query: str) -> dict | None:
 
                 stream_url = info.get("url")
                 if not stream_url:
-                    formats = info.get("formats", [])
-                    audio_fmts = [f for f in formats if f.get("acodec") != "none" and f.get("url")]
-                    if audio_fmts:
-                        audio_fmts.sort(key=lambda x: x.get("abr") or 0, reverse=True)
-                        stream_url = audio_fmts[0]["url"]
+                    fmts = info.get("formats", [])
+                    audio = [f for f in fmts if f.get("acodec") != "none" and f.get("url")]
+                    if audio:
+                        audio.sort(key=lambda x: x.get("abr") or 0, reverse=True)
+                        stream_url = audio[0]["url"]
 
                 if not stream_url:
                     continue
 
-                return parse_song_info_stream(info, stream_url)
-
+                return build_song_info(info, stream_url)
         except Exception:
             continue
-
     return None
 
 
 def search_song_info(query: str) -> dict | None:
-    """Quick search to get song title + thumbnail for /addplay confirmation."""
     for client_args in FALLBACK_CLIENTS:
         try:
-            opts = dict(YDL_SEARCH_OPTS)
+            opts = dict(BASE_YDL_OPTS)
             opts["extractor_args"] = client_args
 
             with yt_dlp.YoutubeDL(opts) as ydl:
-                info = ydl.extract_info(f"ytsearch1:{query}", download=False)
-                if info and "entries" in info:
-                    entries = [e for e in info["entries"] if e]
-                    if entries:
-                        e = entries[0]
-                        thumbs = e.get("thumbnails", [])
-                        thumb = thumbs[-1]["url"] if thumbs else None
-                        return {
-                            "title": e.get("title", query),
-                            "url": e.get("webpage_url", ""),
-                            "thumbnail": thumb,
-                            "duration": e.get("duration", 0),
-                            "uploader": e.get("uploader", "Unknown"),
-                        }
+                if is_url(query):
+                    info = ydl.extract_info(query, download=False)
+                else:
+                    info = ydl.extract_info(f"ytsearch1:{query}", download=False)
+                    if info and "entries" in info:
+                        entries = [e for e in info["entries"] if e]
+                        if entries:
+                            info = entries[0]
+                        else:
+                            continue
+
+                if not info:
+                    continue
+
+                thumbs = info.get("thumbnails", [])
+                thumb = thumbs[-1]["url"] if thumbs else None
+                return {
+                    "title": info.get("title", query),
+                    "url": info.get("webpage_url", ""),
+                    "thumbnail": thumb,
+                    "duration": info.get("duration", 0),
+                    "uploader": info.get("uploader", "Unknown"),
+                }
         except Exception:
             continue
     return None
 
 
-def parse_song_info_stream(info: dict, stream_url: str) -> dict:
+def build_song_info(info: dict, stream_url: str) -> dict:
     title = info.get("title", "Unknown")
     uploader = info.get("uploader", "Unknown Artist")
-
-    sn = title
-    an = uploader
+    sn, an = title, uploader
 
     for sep in [" - ", " — ", " – "]:
         if sep in title:
@@ -211,7 +244,7 @@ def parse_song_info_stream(info: dict, stream_url: str) -> dict:
             an, sn = p[0].strip(), p[1].strip()
             break
 
-    tags = [
+    remove_tags = [
         "(Official Audio)", "(Official Video)", "(Official Music Video)",
         "[Official Audio]", "[Official Video]", "(Lyric Video)",
         "(Audio)", "(HD)", "(Full Song)", "[Full Song]",
@@ -219,19 +252,17 @@ def parse_song_info_stream(info: dict, stream_url: str) -> dict:
         "(Full Audio)", "[Full Audio]", "(Official Lyric Video)",
         "[Official Music Video]", "(Music Video)", "[Music Video]",
     ]
-    for t in tags:
+    for t in remove_tags:
         sn = sn.replace(t, "").replace(t.lower(), "").strip()
         an = an.replace(t, "").replace(t.lower(), "").strip()
 
     thumbs = info.get("thumbnails", [])
     thumb = thumbs[-1]["url"] if thumbs else None
-    dur = info.get("duration") or 0
 
     return {
         "name": sn or title,
         "artist": an or uploader,
-        "album": "YouTube Music",
-        "duration_sec": dur,
+        "duration_sec": info.get("duration") or 0,
         "thumbnail": thumb,
         "stream_url": stream_url,
         "title": title,
@@ -239,7 +270,7 @@ def parse_song_info_stream(info: dict, stream_url: str) -> dict:
     }
 
 # ============================================
-# FFmpeg source from URL - smooth streaming
+# FFmpeg streaming source
 # ============================================
 FFMPEG_BEFORE = (
     "-nostdin -hide_banner -loglevel error "
@@ -249,24 +280,24 @@ FFMPEG_BEFORE = (
 )
 FFMPEG_OPTS = "-vn -sn -dn -b:a 192k"
 
-
-def make_source(stream_url: str):
+def make_source(url: str):
     return discord.PCMVolumeTransformer(
-        discord.FFmpegPCMAudio(
-            stream_url,
-            executable=FFMPEG_PATH,
-            before_options=FFMPEG_BEFORE,
-            options=FFMPEG_OPTS,
-        ),
+        discord.FFmpegPCMAudio(url, executable=FFMPEG_PATH,
+                               before_options=FFMPEG_BEFORE, options=FFMPEG_OPTS),
         volume=0.65,
     )
 
 # ============================================
-# Embed builder - Professional design
+# Embed builder
 # ============================================
+def fmt_time(seconds: int) -> str:
+    s = str(timedelta(seconds=seconds))
+    return s[2:] if s.startswith("0:") else s
+
 def make_embed(song: dict, gid: int, status: str = "playing"):
     data = music_data.get(gid, {})
     dur = max(int(song.get("duration_sec", 0)), 1)
+    el = 0
 
     if status == "playing" and "start_time" in data:
         tp = data.get("total_paused", 0.0)
@@ -274,95 +305,49 @@ def make_embed(song: dict, gid: int, status: str = "playing"):
     elif status == "paused" and data.get("pause_time"):
         tp = data.get("total_paused", 0.0)
         el = min(data["pause_time"] - data["start_time"] - tp, dur)
-    else:
-        el = 0
 
     el = max(0, int(el))
     rem = max(0, dur - el)
     ratio = min(el / dur, 1.0)
-    filled = int(18 * ratio)
-    bar = "▰" * filled + "▱" * (18 - filled)
+    filled = int(16 * ratio)
+    bar = "▰" * filled + "▱" * (16 - filled)
 
-    config = {
-        "playing": {
-            "color": discord.Color.from_rgb(30, 215, 96),
-            "status_icon": "▶️",
-            "status_text": "Now Playing",
-            "dot": "🟢",
-        },
-        "paused": {
-            "color": discord.Color.from_rgb(255, 193, 7),
-            "status_icon": "⏸️",
-            "status_text": "Paused",
-            "dot": "🟡",
-        },
-        "stopped": {
-            "color": discord.Color.from_rgb(220, 53, 69),
-            "status_icon": "⏹️",
-            "status_text": "Stopped",
-            "dot": "🔴",
-        },
+    styles = {
+        "playing": (discord.Color.from_rgb(30, 215, 96), EMOJI_PLAY, "Now Playing", EMOJI_DOT_GREEN),
+        "paused": (discord.Color.from_rgb(255, 193, 7), EMOJI_PAUSE, "Paused", EMOJI_DOT_YELLOW),
+        "stopped": (discord.Color.from_rgb(220, 53, 69), EMOJI_STOP, "Stopped", EMOJI_DOT_RED),
     }
-    c = config.get(status, config["playing"])
+    color, icon, label, dot = styles.get(status, styles["playing"])
 
-    # Playlist info
-    pl_info = ""
+    em = discord.Embed(color=color)
+    em.set_author(name=f"{icon}  {label}")
+
+    em.description = (
+        f"**{song['name']}**\n"
+        f"{EMOJI_ARTIST} {song['artist']}\n\n"
+        f"`{fmt_time(el)}` {bar} `{fmt_time(dur)}`\n"
+        f"{EMOJI_LOADING} **{fmt_time(rem)}** remaining"
+    )
+
+    # Playlist info line
     if data.get("playlist_mode"):
-        pl_idx = data.get("playlist_index", 0) + 1
-        pl_total = data.get("playlist_total", 0)
-        pl_type = data.get("playlist_type", "")
-        type_label = {"start": "▶ Sequential", "end": "◀ Reverse", "random": "🔀 Shuffle"}.get(pl_type, "")
-        pl_info = f"\n📋 Playlist: **{pl_idx}/{pl_total}** • {type_label}"
-
-    em = discord.Embed(color=c["color"])
-    em.set_author(name=f"{c['status_icon']} {c['status_text']}", icon_url="https://i.imgur.com/jbPMuCO.png")
-
-    em.add_field(
-        name="🎵 Song",
-        value=f"**{song['name']}**",
-        inline=True,
-    )
-    em.add_field(
-        name="🎤 Artist",
-        value=f"{song['artist']}",
-        inline=True,
-    )
-    em.add_field(
-        name=f"{c['dot']} Status",
-        value=f"{c['status_text']}",
-        inline=True,
-    )
-
-    elapsed_str = str(timedelta(seconds=el))
-    if elapsed_str.startswith("0:"):
-        elapsed_str = elapsed_str[2:]
-    dur_str = str(timedelta(seconds=dur))
-    if dur_str.startswith("0:"):
-        dur_str = dur_str[2:]
-    rem_str = str(timedelta(seconds=rem))
-    if rem_str.startswith("0:"):
-        rem_str = rem_str[2:]
-
-    em.add_field(
-        name="⏱️ Progress",
-        value=f"`{elapsed_str}` {bar} `{dur_str}`\n⏳ Remaining: **{rem_str}**{pl_info}",
-        inline=False,
-    )
+        idx = data.get("playlist_index", 0) + 1
+        total = data.get("playlist_total", 0)
+        pl_name = data.get("playlist_name", "")
+        ptype = data.get("playlist_type", "")
+        tl = {"start": f"{EMOJI_FORWARD} Sequential", "end": f"{EMOJI_BACKWARD} Reverse",
+              "random": f"{EMOJI_SHUFFLE} Shuffle"}.get(ptype, "")
+        em.description += f"\n{EMOJI_PLAYLIST} **{pl_name}** — {idx}/{total} {tl}"
 
     if song.get("thumbnail"):
         em.set_thumbnail(url=song["thumbnail"])
 
-    em.set_footer(text="🎧 Music Bot  •  /song  •  /playlist  •  /addplay")
-
+    em.set_footer(text=f"{EMOJI_HEADPHONE}  /song  ·  /playlist  ·  /addplay")
     return em
 
-# ============================================
-# Helper
-# ============================================
 async def safe_edit(msg, **kw):
     with suppress(Exception):
         await msg.edit(**kw)
-
 
 # ============================================
 # Session management
@@ -391,156 +376,121 @@ async def on_track_end(gid: int, sid: str, err):
         song = data.get("song_info")
         vc = data.get("vc")
         msg = data.get("message")
-        channel = data.get("text_channel")
-        playlist_mode = data.get("playlist_mode", False)
-        playlist_order = data.get("playlist_order", [])
-        playlist_index = data.get("playlist_index", 0)
-        playlist_type = data.get("playlist_type", "")
-        playlist_played = data.get("playlist_played", set())
+        pl_mode = data.get("playlist_mode", False)
+        pl_order = data.get("playlist_order", [])
+        pl_index = data.get("playlist_index", 0)
+        pl_type = data.get("playlist_type", "")
+        pl_name = data.get("playlist_name", "")
         vc_channel = vc.channel if vc and vc.is_connected() else None
 
-        # Check if should auto-play next from playlist
         next_query = None
         next_index = 0
-        next_played = set(playlist_played)
+        next_order = pl_order
+        next_pl_mode = pl_mode
+        next_pl_type = pl_type
+        next_pl_name = pl_name
 
-        guild_pl = get_guild_playlist(gid)
-
-        if guild_pl and vc_channel:
-            if playlist_mode and playlist_order:
-                # Playing from /playlist command
-                ni = playlist_index + 1
-                if ni < len(playlist_order):
-                    next_query = playlist_order[ni]
+        if vc_channel:
+            if pl_mode and pl_order:
+                ni = pl_index + 1
+                if ni < len(pl_order):
+                    next_query = pl_order[ni]
                     next_index = ni
-                elif playlist_type == "random":
-                    # Restart random cycle
-                    new_order = list(guild_pl)
-                    random.shuffle(new_order)
-                    playlist_order = new_order
-                    next_query = playlist_order[0]
-                    next_index = 0
-                    next_played = set()
                 else:
-                    # Restart sequential
-                    if playlist_type == "start":
-                        playlist_order = list(guild_pl)
-                    else:
-                        playlist_order = list(reversed(guild_pl))
-                    next_query = playlist_order[0]
+                    # Restart cycle
+                    fresh = get_playlist(gid, pl_name)
+                    if fresh:
+                        if pl_type == "random":
+                            next_order = list(fresh)
+                            random.shuffle(next_order)
+                        elif pl_type == "end":
+                            next_order = list(reversed(fresh))
+                        else:
+                            next_order = list(fresh)
+                        next_query = next_order[0]
+                        next_index = 0
+            elif not pl_mode:
+                # Auto-play from default playlist after /song
+                pname, psongs = get_default_playlist(gid)
+                if pname and psongs:
+                    next_order = list(psongs)
+                    next_query = next_order[0]
                     next_index = 0
-                    next_played = set()
-            elif not playlist_mode and guild_pl:
-                # Auto-play from default playlist after /song ends
-                playlist_order = list(guild_pl)
-                next_query = playlist_order[0]
-                next_index = 0
-                playlist_mode = True
-                playlist_type = "start"
-                next_played = set()
+                    next_pl_mode = True
+                    next_pl_type = "start"
+                    next_pl_name = pname
 
         music_data.pop(gid, None)
 
         if next_query and vc_channel:
-            # Auto-play next song
             if msg:
                 await safe_edit(msg, embed=discord.Embed(
-                    title="⏭️ Loading Next Song",
+                    title=f"{EMOJI_SKIP}  Loading Next",
                     description=f"```{next_query}```",
-                    color=discord.Color.blue(),
+                    color=discord.Color.blurple(),
                 ), view=discord.ui.View())
 
-            await _play_next(
-                gid, vc, vc_channel, channel, next_query,
-                playlist_mode, playlist_order, next_index,
-                playlist_type, next_played, msg
-            )
+            await _play_next(gid, vc, msg, next_query, next_pl_mode,
+                             next_order, next_index, next_pl_type, next_pl_name)
         else:
-            # No playlist - end
             if vc:
                 with suppress(Exception):
                     if vc.is_connected():
                         await vc.disconnect()
             if msg:
+                em = discord.Embed(color=discord.Color.from_rgb(30, 215, 96))
                 if err:
-                    em = discord.Embed(
-                        title="❌ Playback Error",
-                        description="An error occurred.",
-                        color=discord.Color.red(),
-                    )
+                    em.title = f"{EMOJI_CANCEL}  Playback Error"
+                    em.color = discord.Color.red()
                 else:
-                    em = discord.Embed(
-                        title="✅ Song Finished",
-                        color=discord.Color.from_rgb(30, 215, 96),
-                    )
+                    em.title = f"{EMOJI_ADD}  Song Finished"
                     if song:
-                        em.add_field(name="🎵 Song", value=f"**{song['name']}**", inline=True)
-                        em.add_field(name="🎤 Artist", value=song["artist"], inline=True)
+                        em.description = f"**{song['name']}** — {song['artist']}"
                         if song.get("thumbnail"):
                             em.set_thumbnail(url=song["thumbnail"])
-                    em.set_footer(text="Use /song or /playlist to play more music")
+                em.set_footer(text="Use /song or /playlist to play more")
                 await safe_edit(msg, embed=em, view=discord.ui.View())
 
 
-async def _play_next(gid, vc, vc_channel, text_channel, query,
-                     playlist_mode, playlist_order, playlist_index,
-                     playlist_type, playlist_played, old_msg):
-    """Internal: play next song in playlist chain."""
+async def _play_next(gid, vc, old_msg, query, pl_mode, pl_order,
+                     pl_index, pl_type, pl_name):
     loop = asyncio.get_running_loop()
     song = await loop.run_in_executor(None, extract_song_url, query)
 
     if not song:
-        # Skip this song, try next
-        ni = playlist_index + 1
-        if ni < len(playlist_order):
-            await _play_next(
-                gid, vc, vc_channel, text_channel,
-                playlist_order[ni], playlist_mode, playlist_order,
-                ni, playlist_type, playlist_played, old_msg
-            )
+        ni = pl_index + 1
+        if ni < len(pl_order):
+            await _play_next(gid, vc, old_msg, pl_order[ni], pl_mode,
+                             pl_order, ni, pl_type, pl_name)
         else:
             with suppress(Exception):
                 if vc.is_connected():
                     await vc.disconnect()
             if old_msg:
                 await safe_edit(old_msg, embed=discord.Embed(
-                    title="📋 Playlist Finished",
-                    description="All songs have been played!",
-                    color=discord.Color.blue(),
+                    title=f"{EMOJI_PLAYLIST}  Playlist Finished",
+                    description="All songs played!",
+                    color=discord.Color.blurple(),
                 ), view=discord.ui.View())
         return
 
     try:
         source = make_source(song["stream_url"])
     except Exception:
-        # Skip
-        ni = playlist_index + 1
-        if ni < len(playlist_order):
-            await _play_next(
-                gid, vc, vc_channel, text_channel,
-                playlist_order[ni], playlist_mode, playlist_order,
-                ni, playlist_type, playlist_played, old_msg
-            )
+        ni = pl_index + 1
+        if ni < len(pl_order):
+            await _play_next(gid, vc, old_msg, pl_order[ni], pl_mode,
+                             pl_order, ni, pl_type, pl_name)
         return
 
     sid = uuid.uuid4().hex
-
     music_data[gid] = {
-        "sid": sid,
-        "vc": vc,
-        "song_info": song,
-        "is_paused": False,
-        "start_time": time.time(),
-        "pause_time": None,
-        "total_paused": 0.0,
-        "message": old_msg,
-        "text_channel": text_channel,
-        "playlist_mode": playlist_mode,
-        "playlist_order": playlist_order,
-        "playlist_index": playlist_index,
-        "playlist_total": len(playlist_order),
-        "playlist_type": playlist_type,
-        "playlist_played": playlist_played,
+        "sid": sid, "vc": vc, "song_info": song,
+        "is_paused": False, "start_time": time.time(),
+        "pause_time": None, "total_paused": 0.0, "message": old_msg,
+        "playlist_mode": pl_mode, "playlist_order": pl_order,
+        "playlist_index": pl_index, "playlist_total": len(pl_order),
+        "playlist_type": pl_type, "playlist_name": pl_name,
     }
 
     def after_cb(error):
@@ -556,19 +506,16 @@ async def _play_next(gid, vc, vc_channel, text_channel, query,
         return
 
     await asyncio.sleep(0.5)
-    cur = music_data.get(gid)
-    if not cur or cur.get("sid") != sid:
+    if gid not in music_data or music_data[gid].get("sid") != sid:
         return
 
     view = Controls(song, gid)
     if old_msg:
         await safe_edit(old_msg, embed=make_embed(song, gid, "playing"), view=view)
-
     bot.loop.create_task(updater(gid, sid, song, view, old_msg))
 
-
 # ============================================
-# Controls View
+# Controls
 # ============================================
 class Controls(discord.ui.View):
     def __init__(self, song, gid):
@@ -576,7 +523,7 @@ class Controls(discord.ui.View):
         self.song = song
         self.gid = gid
 
-    @discord.ui.button(label="Pause", emoji="⏸️", style=discord.ButtonStyle.primary, custom_id="m_pause")
+    @discord.ui.button(label="Pause", emoji=EMOJI_PAUSE, style=discord.ButtonStyle.primary, custom_id="m_pause")
     async def btn_pause(self, inter, btn):
         async with get_lock(self.gid):
             d = music_data.get(self.gid)
@@ -590,7 +537,7 @@ class Controls(discord.ui.View):
             d["pause_time"] = time.time()
             await inter.response.edit_message(embed=make_embed(self.song, self.gid, "paused"), view=self)
 
-    @discord.ui.button(label="Resume", emoji="▶️", style=discord.ButtonStyle.success, custom_id="m_resume")
+    @discord.ui.button(label="Resume", emoji=EMOJI_PLAY, style=discord.ButtonStyle.success, custom_id="m_resume")
     async def btn_resume(self, inter, btn):
         async with get_lock(self.gid):
             d = music_data.get(self.gid)
@@ -606,13 +553,12 @@ class Controls(discord.ui.View):
             d["is_paused"] = False
             await inter.response.edit_message(embed=make_embed(self.song, self.gid, "playing"), view=self)
 
-    @discord.ui.button(label="Stop", emoji="⏹️", style=discord.ButtonStyle.danger, custom_id="m_stop")
+    @discord.ui.button(label="Stop", emoji=EMOJI_STOP, style=discord.ButtonStyle.danger, custom_id="m_stop")
     async def btn_stop(self, inter, btn):
         async with get_lock(self.gid):
             d = music_data.get(self.gid)
             if not d:
                 return await inter.response.send_message("Nothing playing.", ephemeral=True)
-            # Disable playlist auto-play
             d["playlist_mode"] = False
             d["playlist_order"] = []
             await end_session(self.gid, disconnect=True)
@@ -620,7 +566,7 @@ class Controls(discord.ui.View):
                 c.disabled = True
             await inter.response.edit_message(embed=make_embed(self.song, self.gid, "stopped"), view=self)
 
-    @discord.ui.button(label="Skip", emoji="⏭️", style=discord.ButtonStyle.secondary, custom_id="m_skip")
+    @discord.ui.button(label="Skip", emoji=EMOJI_SKIP, style=discord.ButtonStyle.secondary, custom_id="m_skip")
     async def btn_skip(self, inter, btn):
         async with get_lock(self.gid):
             d = music_data.get(self.gid)
@@ -628,25 +574,17 @@ class Controls(discord.ui.View):
                 return await inter.response.send_message("Nothing playing.", ephemeral=True)
             vc = d["vc"]
             if vc.is_playing() or vc.is_paused():
-                vc.stop()  # triggers after_cb -> on_track_end -> next song
-            await inter.response.send_message("⏭️ Skipping...", ephemeral=True)
+                vc.stop()
+            await inter.response.send_message(f"{EMOJI_SKIP} Skipping...", ephemeral=True)
 
-    @discord.ui.button(label="New Song", emoji="🔍", style=discord.ButtonStyle.secondary, custom_id="m_new")
+    @discord.ui.button(label="New Song", emoji=EMOJI_SEARCH, style=discord.ButtonStyle.secondary, custom_id="m_new")
     async def btn_new(self, inter, btn):
         await inter.response.send_modal(SongModal(self.gid))
 
 
-# ============================================
-# Song Modal
-# ============================================
-class SongModal(discord.ui.Modal, title="🎵 Play New Song"):
-    inp = discord.ui.TextInput(
-        label="Song Name",
-        placeholder="Enter song name or YouTube URL...",
-        required=True,
-        max_length=200,
-    )
-
+class SongModal(discord.ui.Modal, title="Play New Song"):
+    inp = discord.ui.TextInput(label="Song Name", placeholder="Song name or URL...",
+                               required=True, max_length=200)
     def __init__(self, gid):
         super().__init__()
         self.gid = gid
@@ -663,151 +601,288 @@ class SongModal(discord.ui.Modal, title="🎵 Play New Song"):
             return await inter.followup.send("Join a voice channel first.", ephemeral=True)
         await play_song(inter, self.inp.value, vc_ch)
 
+# ============================================
+# Addplay - Playlist name modal
+# ============================================
+class NewPlaylistModal(discord.ui.Modal, title="Create New Playlist"):
+    name_input = discord.ui.TextInput(label="Playlist Name", placeholder="My Playlist...",
+                                      required=True, max_length=50)
+    def __init__(self, gid: int, song_query: str, user_id: int, user_name: str):
+        super().__init__()
+        self.gid = gid
+        self.song_query = song_query
+        self.user_id = user_id
+        self.user_name = user_name
 
-# ============================================
-# Addplay confirmation view
-# ============================================
-class AddPlayConfirm(discord.ui.View):
-    def __init__(self, gid: int, song_title: str, user_id: int, user_name: str):
+    async def on_submit(self, inter):
+        pl_name = self.name_input.value.strip()
+        if not pl_name:
+            return await inter.response.send_message("Name cannot be empty.", ephemeral=True)
+
+        existing = get_all_playlist_names(self.gid)
+        if pl_name.lower() in [n.lower() for n in existing]:
+            return await inter.response.send_message(
+                f"{EMOJI_WARN} Playlist **{pl_name}** already exists. Use it from the dropdown.",
+                ephemeral=True)
+
+        # Create empty playlist first
+        save_playlist(self.gid, pl_name, [])
+        await inter.response.defer(thinking=True)
+        await process_addplay(inter, self.gid, pl_name, self.song_query,
+                              self.user_id, self.user_name)
+
+
+class PlaylistSelectForAdd(discord.ui.View):
+    def __init__(self, gid: int, existing: list, song_query: str, user_id: int, user_name: str):
+        super().__init__(timeout=120)
+        self.gid = gid
+        self.song_query = song_query
+        self.user_id = user_id
+        self.user_name = user_name
+
+        options = []
+        for name in existing[:24]:
+            count = len(get_playlist(gid, name))
+            options.append(discord.SelectOption(
+                label=name, description=f"{count} songs", emoji=EMOJI_MUSIC))
+        options.append(discord.SelectOption(
+            label="➕ Create New Playlist", value="__NEW__",
+            description="Create a brand new playlist", emoji=EMOJI_ADD))
+
+        select = discord.ui.Select(placeholder="Select a playlist...",
+                                   options=options, custom_id="pl_select_add")
+        select.callback = self.on_select
+        self.add_item(select)
+
+    async def on_select(self, inter):
+        if inter.user.id != self.user_id:
+            return await inter.response.send_message("Not your request.", ephemeral=True)
+
+        val = inter.data["values"][0]
+        if val == "__NEW__":
+            await inter.response.send_modal(
+                NewPlaylistModal(self.gid, self.song_query, self.user_id, self.user_name))
+        else:
+            await inter.response.defer(thinking=True)
+            await process_addplay(inter, self.gid, val, self.song_query,
+                                  self.user_id, self.user_name)
+
+
+async def process_addplay(inter, gid, pl_name, song_query, user_id, user_name):
+    """Search song and show confirmation."""
+    songs_to_add = [s.strip() for s in song_query.split(",") if s.strip()]
+
+    loop = asyncio.get_running_loop()
+
+    for sq in songs_to_add:
+        info = await loop.run_in_executor(None, search_song_info, sq)
+
+        if not info:
+            await inter.followup.send(embed=discord.Embed(
+                title=f"{EMOJI_CANCEL}  Not Found",
+                description=f"Could not find: **{sq}**",
+                color=discord.Color.red(),
+            ), ephemeral=True)
+            continue
+
+        em = discord.Embed(
+            title=f"{EMOJI_MUSIC}  Add to Playlist?",
+            color=discord.Color.blurple(),
+        )
+        em.description = (
+            f"**{info['title']}**\n"
+            f"{EMOJI_ARTIST} {info['uploader']}"
+        )
+        if info.get("duration"):
+            em.description += f"\n{EMOJI_TIME} {fmt_time(info['duration'])}"
+        em.description += f"\n\n{EMOJI_FOLDER} Playlist: **{pl_name}**"
+
+        if info.get("thumbnail"):
+            em.set_image(url=info["thumbnail"])
+
+        view = AddConfirmView(gid, pl_name, info["title"], user_id, user_name)
+        await inter.followup.send(embed=em, view=view)
+
+
+class AddConfirmView(discord.ui.View):
+    def __init__(self, gid, pl_name, song_title, user_id, user_name):
         super().__init__(timeout=60)
         self.gid = gid
+        self.pl_name = pl_name
         self.song_title = song_title
         self.user_id = user_id
         self.user_name = user_name
-        self.responded = False
+        self.done = False
 
-    @discord.ui.button(label="Yes, Save It", emoji="✅", style=discord.ButtonStyle.success)
+    @discord.ui.button(label="Yes, Save It", emoji=EMOJI_ADD, style=discord.ButtonStyle.success)
     async def btn_yes(self, inter, btn):
         if inter.user.id != self.user_id:
-            return await inter.response.send_message("Only the requester can confirm.", ephemeral=True)
-        if self.responded:
+            return await inter.response.send_message("Not your request.", ephemeral=True)
+        if self.done:
             return
-        self.responded = True
+        self.done = True
 
-        pl = get_guild_playlist(self.gid)
-        # Check duplicate
+        pl = get_playlist(self.gid, self.pl_name)
         if self.song_title.lower() not in [s.lower() for s in pl]:
             pl.append(self.song_title)
-            save_guild_playlist(self.gid, pl)
+            save_playlist(self.gid, self.pl_name, pl)
 
-        # Build playlist embed
         em = discord.Embed(
-            title="✅ Song Added to Playlist",
+            title=f"{EMOJI_ADD}  Saved to Playlist",
             color=discord.Color.from_rgb(30, 215, 96),
         )
-        em.add_field(name="🎵 Added Song", value=f"**{self.song_title}**", inline=False)
-        em.add_field(name="👤 Added By", value=f"{self.user_name}", inline=True)
-        em.add_field(name="📋 Total Songs", value=f"**{len(pl)}**", inline=True)
+        em.description = (
+            f"{EMOJI_MUSIC} **{self.song_title}**\n"
+            f"{EMOJI_FOLDER} **{self.pl_name}**\n"
+            f"{EMOJI_USER} {self.user_name}\n"
+        )
 
-        song_list = ""
+        lines = []
         for i, s in enumerate(pl, 1):
-            marker = " 🆕" if s == self.song_title else ""
-            song_list += f"`{i}.` {s}{marker}\n"
-            if i >= 20:
-                remaining = len(pl) - 20
-                if remaining > 0:
-                    song_list += f"\n*...and {remaining} more*"
+            marker = f" {EMOJI_NEW}" if s == self.song_title else ""
+            lines.append(f"`{i}.` {s}{marker}")
+            if i >= 15:
+                left = len(pl) - 15
+                if left > 0:
+                    lines.append(f"*+{left} more...*")
                 break
 
-        em.add_field(name="📜 Current Playlist", value=song_list, inline=False)
-        em.set_footer(text="🎧 Use /playlist to play • /delete to remove songs")
+        em.add_field(name=f"{EMOJI_LIST} Songs ({len(pl)})", value="\n".join(lines), inline=False)
 
         for c in self.children:
             c.disabled = True
         await inter.response.edit_message(embed=em, view=self)
 
-    @discord.ui.button(label="No", emoji="❌", style=discord.ButtonStyle.danger)
+    @discord.ui.button(label="No", emoji=EMOJI_CANCEL, style=discord.ButtonStyle.danger)
     async def btn_no(self, inter, btn):
         if inter.user.id != self.user_id:
-            return await inter.response.send_message("Only the requester can cancel.", ephemeral=True)
-        if self.responded:
+            return await inter.response.send_message("Not your request.", ephemeral=True)
+        if self.done:
             return
-        self.responded = True
-
+        self.done = True
         em = discord.Embed(
-            title="❌ Cancelled",
+            title=f"{EMOJI_CANCEL}  Cancelled",
             description=f"**{self.song_title}** was not added.",
-            color=discord.Color.red(),
+            color=discord.Color.greyple(),
         )
         for c in self.children:
             c.disabled = True
         await inter.response.edit_message(embed=em, view=self)
 
     async def on_timeout(self):
-        self.responded = True
-
+        self.done = True
 
 # ============================================
-# Delete song select menu
+# Delete views
 # ============================================
-class DeleteSelect(discord.ui.Select):
-    def __init__(self, gid: int, songs: list):
+class DeletePlaylistSelect(discord.ui.View):
+    def __init__(self, gid: int, names: list, user_id: int):
+        super().__init__(timeout=60)
         self.gid = gid
+        self.user_id = user_id
+
+        options = []
+        for n in names[:25]:
+            count = len(get_playlist(gid, n))
+            options.append(discord.SelectOption(label=n, description=f"{count} songs", emoji=EMOJI_MUSIC))
+
+        select = discord.ui.Select(placeholder="Select playlist...", options=options)
+        select.callback = self.on_select
+        self.add_item(select)
+
+    async def on_select(self, inter):
+        if inter.user.id != self.user_id:
+            return await inter.response.send_message("Not your request.", ephemeral=True)
+        pl_name = inter.data["values"][0]
+        songs = get_playlist(self.gid, pl_name)
+
+        if not songs:
+            delete_playlist(self.gid, pl_name)
+            return await inter.response.edit_message(
+                embed=discord.Embed(
+                    title=f"{EMOJI_REMOVE}  Empty Playlist Deleted",
+                    description=f"**{pl_name}** removed.",
+                    color=discord.Color.red(),
+                ), view=None)
+
+        view = DeleteSongView(self.gid, pl_name, songs, self.user_id)
+        em = discord.Embed(
+            title=f"{EMOJI_REMOVE}  Delete from: {pl_name}",
+            color=discord.Color.from_rgb(220, 53, 69),
+        )
+        lines = [f"`{i}.` {s}" for i, s in enumerate(songs[:25], 1)]
+        em.description = "\n".join(lines)
+        em.set_footer(text="Select songs to remove, or delete entire playlist")
+        await inter.response.edit_message(embed=em, view=view)
+
+
+class DeleteSongView(discord.ui.View):
+    def __init__(self, gid, pl_name, songs, user_id):
+        super().__init__(timeout=60)
+        self.gid = gid
+        self.pl_name = pl_name
+        self.user_id = user_id
+
         options = []
         for i, s in enumerate(songs[:25]):
-            options.append(discord.SelectOption(
-                label=s[:100],
-                value=str(i),
-                description=f"Position #{i+1}",
-                emoji="🎵",
-            ))
-        super().__init__(
-            placeholder="Select songs to delete...",
-            min_values=1,
-            max_values=min(len(options), 25),
-            options=options,
-        )
+            options.append(discord.SelectOption(label=s[:100], value=str(i), emoji=EMOJI_MUSIC))
 
-    async def callback(self, inter):
-        pl = get_guild_playlist(self.gid)
-        indices = sorted([int(v) for v in self.values], reverse=True)
+        select = discord.ui.Select(placeholder="Select songs to remove...",
+                                   min_values=1, max_values=min(len(options), 25),
+                                   options=options)
+        select.callback = self.on_song_select
+        self.add_item(select)
+
+    @discord.ui.button(label="Delete Entire Playlist", emoji=EMOJI_REMOVE,
+                       style=discord.ButtonStyle.danger, row=2)
+    async def btn_delete_all(self, inter, btn):
+        if inter.user.id != self.user_id:
+            return await inter.response.send_message("Not your request.", ephemeral=True)
+        delete_playlist(self.gid, self.pl_name)
+        await inter.response.edit_message(
+            embed=discord.Embed(
+                title=f"{EMOJI_REMOVE}  Playlist Deleted",
+                description=f"**{self.pl_name}** has been completely removed.",
+                color=discord.Color.red(),
+            ), view=None)
+
+    async def on_song_select(self, inter):
+        if inter.user.id != self.user_id:
+            return await inter.response.send_message("Not your request.", ephemeral=True)
+
+        pl = get_playlist(self.gid, self.pl_name)
+        indices = sorted([int(v) for v in inter.data["values"]], reverse=True)
         removed = []
         for idx in indices:
             if 0 <= idx < len(pl):
                 removed.append(pl.pop(idx))
-        save_guild_playlist(self.gid, pl)
+        save_playlist(self.gid, self.pl_name, pl)
 
         em = discord.Embed(
-            title="🗑️ Songs Removed",
+            title=f"{EMOJI_REMOVE}  Songs Removed",
             color=discord.Color.from_rgb(220, 53, 69),
         )
-        em.add_field(
-            name="❌ Removed",
-            value="\n".join(f"• {r}" for r in removed) or "None",
-            inline=False,
-        )
+        em.description = f"{EMOJI_CANCEL} " + ", ".join(f"**{r}**" for r in removed)
 
         if pl:
-            song_list = ""
-            for i, s in enumerate(pl, 1):
-                song_list += f"`{i}.` {s}\n"
-                if i >= 20:
-                    remaining = len(pl) - 20
-                    if remaining > 0:
-                        song_list += f"\n*...and {remaining} more*"
-                    break
-            em.add_field(name="📜 Updated Playlist", value=song_list, inline=False)
+            lines = [f"`{i}.` {s}" for i, s in enumerate(pl, 1)]
+            if len(lines) > 15:
+                lines = lines[:15]
+                lines.append(f"*+{len(pl)-15} more...*")
+            em.add_field(name=f"{EMOJI_LIST} Remaining ({len(pl)})",
+                         value="\n".join(lines), inline=False)
         else:
-            em.add_field(name="📜 Playlist", value="*Empty - use /addplay to add songs*", inline=False)
+            em.add_field(name=EMOJI_LIST, value="*Playlist is now empty*", inline=False)
+            delete_playlist(self.gid, self.pl_name)
 
-        em.set_footer(text=f"📋 {len(pl)} songs remaining")
-
-        self.disabled = True
-        await inter.response.edit_message(embed=em, view=self.view)
-
-
-class DeleteView(discord.ui.View):
-    def __init__(self, gid: int, songs: list):
-        super().__init__(timeout=60)
-        self.add_item(DeleteSelect(gid, songs))
-
+        await inter.response.edit_message(embed=em, view=None)
 
 # ============================================
 # Main play function
 # ============================================
 async def play_song(inter, query: str, vc_channel, playlist_mode=False,
                     playlist_order=None, playlist_index=0,
-                    playlist_type="", playlist_played=None):
+                    playlist_type="", playlist_name=""):
     guild = inter.guild
     if not guild:
         return await inter.followup.send("Server only.", ephemeral=True)
@@ -815,22 +890,18 @@ async def play_song(inter, query: str, vc_channel, playlist_mode=False,
     gid = guild.id
 
     async with get_lock(gid):
-        msg = await inter.followup.send(
-            embed=discord.Embed(
-                title="🔍 Searching...",
-                description=f"```{query}```",
-                color=discord.Color.blue(),
-            )
-        )
+        msg = await inter.followup.send(embed=discord.Embed(
+            title=f"{EMOJI_SEARCH}  Searching...",
+            description=f"```{query}```",
+            color=discord.Color.blurple(),
+        ))
 
-        # Stop current playback but don't disconnect
-        old_data = music_data.get(gid)
-        if old_data:
-            old_data["playlist_mode"] = False
-            old_data["playlist_order"] = []
+        old = music_data.get(gid)
+        if old:
+            old["playlist_mode"] = False
+            old["playlist_order"] = []
         await end_session(gid, disconnect=False)
 
-        # Connect to voice
         try:
             cur = guild.voice_client
             if cur and cur.is_connected():
@@ -841,50 +912,36 @@ async def play_song(inter, query: str, vc_channel, playlist_mode=False,
                 vc = await vc_channel.connect(timeout=30.0, self_deaf=True)
         except Exception as e:
             return await safe_edit(msg, embed=discord.Embed(
-                title="❌ Voice Connection Error",
-                description=f"`{e}`",
-                color=discord.Color.red(),
-            ))
+                title=f"{EMOJI_CANCEL}  Connection Failed",
+                description=f"`{e}`", color=discord.Color.red()))
 
-        # Extract stream URL (no download!)
         loop = asyncio.get_running_loop()
         song = await loop.run_in_executor(None, extract_song_url, query)
 
         if not song:
             return await safe_edit(msg, embed=discord.Embed(
-                title="❌ Song Not Found",
-                description="Could not find that song. Try a different name.",
-                color=discord.Color.red(),
-            ))
+                title=f"{EMOJI_CANCEL}  Not Found",
+                description="Try a different search term.",
+                color=discord.Color.red()))
 
-        # Create audio source
         try:
             source = make_source(song["stream_url"])
         except Exception as e:
             return await safe_edit(msg, embed=discord.Embed(
-                title="❌ Audio Error",
-                description=f"`{e}`",
-                color=discord.Color.red(),
-            ))
+                title=f"{EMOJI_CANCEL}  Audio Error",
+                description=f"`{e}`", color=discord.Color.red()))
 
         sid = uuid.uuid4().hex
-
         music_data[gid] = {
-            "sid": sid,
-            "vc": vc,
-            "song_info": song,
-            "is_paused": False,
-            "start_time": time.time(),
-            "pause_time": None,
-            "total_paused": 0.0,
-            "message": msg,
-            "text_channel": inter.channel,
+            "sid": sid, "vc": vc, "song_info": song,
+            "is_paused": False, "start_time": time.time(),
+            "pause_time": None, "total_paused": 0.0, "message": msg,
             "playlist_mode": playlist_mode,
             "playlist_order": playlist_order or [],
             "playlist_index": playlist_index,
             "playlist_total": len(playlist_order) if playlist_order else 0,
             "playlist_type": playlist_type,
-            "playlist_played": playlist_played or set(),
+            "playlist_name": playlist_name,
         }
 
         def after_cb(err):
@@ -898,10 +955,8 @@ async def play_song(inter, query: str, vc_channel, playlist_mode=False,
         except Exception as e:
             music_data.pop(gid, None)
             return await safe_edit(msg, embed=discord.Embed(
-                title="❌ Playback Error",
-                description=f"`{e}`",
-                color=discord.Color.red(),
-            ))
+                title=f"{EMOJI_CANCEL}  Playback Error",
+                description=f"`{e}`", color=discord.Color.red()))
 
         await asyncio.sleep(0.8)
         cur = music_data.get(gid)
@@ -914,19 +969,16 @@ async def play_song(inter, query: str, vc_channel, playlist_mode=False,
                 if vc.is_connected():
                     await vc.disconnect()
             return await safe_edit(msg, embed=discord.Embed(
-                title="❌ Playback Failed",
-                description="Could not start playback. Try again.",
-                color=discord.Color.red(),
-            ))
+                title=f"{EMOJI_CANCEL}  Playback Failed",
+                description="Could not start. Try again.",
+                color=discord.Color.red()))
 
         view = Controls(song, gid)
         await safe_edit(msg, embed=make_embed(song, gid, "playing"), view=view)
-
         bot.loop.create_task(updater(gid, sid, song, view, msg))
 
-
 # ============================================
-# Embed updater
+# Updater
 # ============================================
 async def updater(gid, sid, song, view, msg):
     await asyncio.sleep(15)
@@ -944,7 +996,6 @@ async def updater(gid, sid, song, view, msg):
             break
         await asyncio.sleep(30)
 
-
 # ============================================
 # Events
 # ============================================
@@ -956,13 +1007,8 @@ async def on_ready():
         print(f"Synced {len(s)} commands")
     except Exception as e:
         print(f"Sync failed: {e}")
-    await bot.change_presence(
-        activity=discord.Activity(
-            type=discord.ActivityType.listening,
-            name="/song • /playlist",
-        )
-    )
-
+    await bot.change_presence(activity=discord.Activity(
+        type=discord.ActivityType.listening, name="/song · /playlist"))
 
 @bot.tree.error
 async def on_cmd_error(inter, error):
@@ -978,32 +1024,24 @@ async def on_cmd_error(inter, error):
         else:
             await inter.response.send_message(m, ephemeral=True)
 
-
 # ============================================
-# Commands
+# Slash Commands
 # ============================================
 
-# /song
-@bot.tree.command(name="song", description="🎵 Play a song in your voice channel")
+@bot.tree.command(name="song", description="Play a song in your voice channel")
 @app_commands.describe(name="Song name or YouTube URL")
 async def song_cmd(inter, name: str):
     if not inter.guild:
         return await inter.response.send_message("Server only.", ephemeral=True)
     if not inter.user.voice or not inter.user.voice.channel:
-        return await inter.response.send_message(
-            embed=discord.Embed(
-                title="🔇 Join a Voice Channel First",
-                description="You need to be in a voice channel to play music.",
-                color=discord.Color.red(),
-            ),
-            ephemeral=True,
-        )
+        return await inter.response.send_message(embed=discord.Embed(
+            title=f"{EMOJI_SPEAKER}  Join a Voice Channel",
+            color=discord.Color.red()), ephemeral=True)
     await inter.response.defer(thinking=True)
     await play_song(inter, name, inter.user.voice.channel)
 
 
-# /stop
-@bot.tree.command(name="stop", description="⏹️ Stop playback and disconnect")
+@bot.tree.command(name="stop", description="Stop playback and disconnect")
 async def stop_cmd(inter):
     if not inter.guild:
         return await inter.response.send_message("Server only.", ephemeral=True)
@@ -1011,79 +1049,42 @@ async def stop_cmd(inter):
     async with get_lock(gid):
         d = music_data.get(gid)
         if not d:
-            return await inter.response.send_message("Nothing is playing.", ephemeral=True)
+            return await inter.response.send_message("Nothing playing.", ephemeral=True)
         d["playlist_mode"] = False
         d["playlist_order"] = []
         await end_session(gid, disconnect=True)
-        await inter.response.send_message(
-            embed=discord.Embed(
-                title="⏹️ Stopped",
-                description="Playback stopped and disconnected.",
-                color=discord.Color.red(),
-            )
-        )
+        await inter.response.send_message(embed=discord.Embed(
+            title=f"{EMOJI_STOP}  Stopped",
+            description="Playback stopped.",
+            color=discord.Color.red()))
 
 
-# /addplay
-@bot.tree.command(name="addplay", description="📋 Add song(s) to the default playlist")
-@app_commands.describe(name="Song name(s) - separate multiple with commas")
+@bot.tree.command(name="addplay", description="Add song(s) to a playlist")
+@app_commands.describe(name="Song name(s) or URL(s) — separate with commas")
 async def addplay_cmd(inter, name: str):
     if not inter.guild:
         return await inter.response.send_message("Server only.", ephemeral=True)
 
     gid = inter.guild.id
-    songs = [s.strip() for s in name.split(",") if s.strip()]
+    existing = get_all_playlist_names(gid)
 
-    if not songs:
-        return await inter.response.send_message("Please provide at least one song name.", ephemeral=True)
-
-    await inter.response.defer(thinking=True)
-
-    loop = asyncio.get_running_loop()
-
-    for song_name in songs:
-        # Search for the song
-        info = await loop.run_in_executor(None, search_song_info, song_name)
-
-        if not info:
-            await inter.followup.send(
-                embed=discord.Embed(
-                    title="❌ Not Found",
-                    description=f"Could not find: **{song_name}**",
-                    color=discord.Color.red(),
-                ),
-                ephemeral=True,
-            )
-            continue
-
-        # Show confirmation with thumbnail
+    if not existing:
+        # No playlists exist, show modal to create one
+        await inter.response.send_modal(
+            NewPlaylistModal(gid, name, inter.user.id, inter.user.display_name))
+    else:
+        # Show dropdown to pick playlist or create new
         em = discord.Embed(
-            title="🎵 Song Found - Add to Playlist?",
-            color=discord.Color.from_rgb(88, 101, 242),
+            title=f"{EMOJI_FOLDER}  Select Playlist",
+            description=f"Choose where to add:\n```{name}```",
+            color=discord.Color.blurple(),
         )
-        em.add_field(name="🎵 Title", value=f"**{info['title']}**", inline=False)
-        em.add_field(name="🎤 Artist", value=info["uploader"], inline=True)
-        if info.get("duration"):
-            dur_str = str(timedelta(seconds=info["duration"]))
-            if dur_str.startswith("0:"):
-                dur_str = dur_str[2:]
-            em.add_field(name="⏱️ Duration", value=dur_str, inline=True)
-
-        if info.get("thumbnail"):
-            em.set_image(url=info["thumbnail"])
-
-        em.set_footer(text="Click below to confirm")
-
-        view = AddPlayConfirm(gid, info["title"], inter.user.id, inter.user.display_name)
-        await inter.followup.send(embed=em, view=view)
+        view = PlaylistSelectForAdd(gid, existing, name, inter.user.id, inter.user.display_name)
+        await inter.response.send_message(embed=em, view=view, ephemeral=True)
 
 
-# /playlist
-class PlaylistOrderChoice(app_commands.Choice[str]):
-    pass
-
-@bot.tree.command(name="playlist", description="🎶 Play songs from the default playlist")
-@app_commands.describe(order="Choose play order")
+@bot.tree.command(name="playlist", description="Play songs from a playlist")
+@app_commands.describe(order="Play order")
 @app_commands.choices(order=[
     app_commands.Choice(name="▶ From Starting ↓", value="start"),
     app_commands.Choice(name="◀ From Ending ↑", value="end"),
@@ -1093,119 +1094,176 @@ async def playlist_cmd(inter, order: str):
     if not inter.guild:
         return await inter.response.send_message("Server only.", ephemeral=True)
     if not inter.user.voice or not inter.user.voice.channel:
-        return await inter.response.send_message(
-            embed=discord.Embed(
-                title="🔇 Join a Voice Channel First",
-                color=discord.Color.red(),
-            ),
-            ephemeral=True,
-        )
+        return await inter.response.send_message(embed=discord.Embed(
+            title=f"{EMOJI_SPEAKER}  Join a Voice Channel",
+            color=discord.Color.red()), ephemeral=True)
 
     gid = inter.guild.id
-    pl = get_guild_playlist(gid)
+    names = get_all_playlist_names(gid)
 
-    if not pl:
-        return await inter.response.send_message(
-            embed=discord.Embed(
-                title="📋 Playlist Empty",
-                description="Use `/addplay` to add songs first.",
-                color=discord.Color.orange(),
-            ),
-            ephemeral=True,
+    if not names:
+        return await inter.response.send_message(embed=discord.Embed(
+            title=f"{EMOJI_PLAYLIST}  No Playlists",
+            description="Use `/addplay` to create one first.",
+            color=discord.Color.orange()), ephemeral=True)
+
+    if len(names) == 1:
+        # Only one playlist, play it directly
+        pl_name = names[0]
+        songs = get_playlist(gid, pl_name)
+        if not songs:
+            return await inter.response.send_message(embed=discord.Embed(
+                title=f"{EMOJI_PLAYLIST}  Playlist Empty",
+                description=f"**{pl_name}** has no songs.",
+                color=discord.Color.orange()), ephemeral=True)
+
+        await inter.response.defer(thinking=True)
+        await _start_playlist(inter, gid, pl_name, songs, order)
+    else:
+        # Multiple playlists — show selector
+        view = PlaylistPlaySelect(gid, names, order, inter.user.id,
+                                  inter.user.voice.channel)
+        em = discord.Embed(
+            title=f"{EMOJI_FOLDER}  Select Playlist to Play",
+            color=discord.Color.blurple(),
         )
+        await inter.response.send_message(embed=em, view=view, ephemeral=True)
 
-    # Build order
-    if order == "start":
-        play_order = list(pl)
-    elif order == "end":
-        play_order = list(reversed(pl))
+
+class PlaylistPlaySelect(discord.ui.View):
+    def __init__(self, gid, names, order, user_id, vc_channel):
+        super().__init__(timeout=60)
+        self.gid = gid
+        self.order = order
+        self.user_id = user_id
+        self.vc_channel = vc_channel
+
+        options = []
+        for n in names[:25]:
+            count = len(get_playlist(gid, n))
+            options.append(discord.SelectOption(label=n, description=f"{count} songs", emoji=EMOJI_MUSIC))
+
+        select = discord.ui.Select(placeholder="Select playlist...", options=options)
+        select.callback = self.on_select
+        self.add_item(select)
+
+    async def on_select(self, inter):
+        if inter.user.id != self.user_id:
+            return await inter.response.send_message("Not your request.", ephemeral=True)
+
+        pl_name = inter.data["values"][0]
+        songs = get_playlist(self.gid, pl_name)
+
+        if not songs:
+            return await inter.response.edit_message(embed=discord.Embed(
+                title=f"{EMOJI_PLAYLIST}  Empty",
+                description=f"**{pl_name}** has no songs.",
+                color=discord.Color.orange()), view=None)
+
+        await inter.response.defer(thinking=True)
+        await _start_playlist(inter, self.gid, pl_name, songs, self.order)
+
+
+async def _start_playlist(inter, gid, pl_name, songs, order):
+    if order == "end":
+        play_order = list(reversed(songs))
     elif order == "random":
-        play_order = list(pl)
+        play_order = list(songs)
         random.shuffle(play_order)
     else:
-        play_order = list(pl)
+        play_order = list(songs)
 
-    await inter.response.defer(thinking=True)
+    vc_ch = inter.user.voice.channel if inter.user.voice else None
+    if not vc_ch:
+        return await inter.followup.send("Join a voice channel.", ephemeral=True)
 
-    first_song = play_order[0]
-    await play_song(
-        inter, first_song, inter.user.voice.channel,
-        playlist_mode=True,
-        playlist_order=play_order,
-        playlist_index=0,
-        playlist_type=order,
-        playlist_played=set(),
-    )
+    await play_song(inter, play_order[0], vc_ch,
+                    playlist_mode=True, playlist_order=play_order,
+                    playlist_index=0, playlist_type=order,
+                    playlist_name=pl_name)
 
 
-# /delete
-@bot.tree.command(name="delete", description="🗑️ Remove song(s) from the playlist")
+@bot.tree.command(name="delete", description="Remove songs or playlists")
 async def delete_cmd(inter):
     if not inter.guild:
         return await inter.response.send_message("Server only.", ephemeral=True)
 
     gid = inter.guild.id
-    pl = get_guild_playlist(gid)
+    names = get_all_playlist_names(gid)
 
-    if not pl:
-        return await inter.response.send_message(
-            embed=discord.Embed(
-                title="📋 Playlist Empty",
-                description="Nothing to delete.",
-                color=discord.Color.orange(),
-            ),
-            ephemeral=True,
+    if not names:
+        return await inter.response.send_message(embed=discord.Embed(
+            title=f"{EMOJI_PLAYLIST}  Nothing to Delete",
+            description="No playlists exist.",
+            color=discord.Color.orange()), ephemeral=True)
+
+    if len(names) == 1:
+        pl_name = names[0]
+        songs = get_playlist(gid, pl_name)
+        if not songs:
+            delete_playlist(gid, pl_name)
+            return await inter.response.send_message(embed=discord.Embed(
+                title=f"{EMOJI_REMOVE}  Deleted",
+                description=f"Empty playlist **{pl_name}** removed.",
+                color=discord.Color.red()), ephemeral=True)
+
+        view = DeleteSongView(gid, pl_name, songs, inter.user.id)
+        em = discord.Embed(
+            title=f"{EMOJI_REMOVE}  Delete from: {pl_name}",
+            color=discord.Color.from_rgb(220, 53, 69),
         )
-
-    em = discord.Embed(
-        title="🗑️ Select Songs to Delete",
-        description="Choose one or more songs to remove from the playlist.",
-        color=discord.Color.from_rgb(220, 53, 69),
-    )
-
-    song_list = ""
-    for i, s in enumerate(pl, 1):
-        song_list += f"`{i}.` {s}\n"
-        if i >= 25:
-            break
-
-    em.add_field(name="📜 Current Playlist", value=song_list, inline=False)
-    em.set_footer(text=f"📋 {len(pl)} songs total")
-
-    view = DeleteView(gid, pl)
-    await inter.response.send_message(embed=em, view=view, ephemeral=True)
+        lines = [f"`{i}.` {s}" for i, s in enumerate(songs[:25], 1)]
+        em.description = "\n".join(lines)
+        await inter.response.send_message(embed=em, view=view, ephemeral=True)
+    else:
+        view = DeletePlaylistSelect(gid, names, inter.user.id)
+        em = discord.Embed(
+            title=f"{EMOJI_REMOVE}  Select Playlist",
+            description="Choose a playlist to manage.",
+            color=discord.Color.from_rgb(220, 53, 69),
+        )
+        await inter.response.send_message(embed=em, view=view, ephemeral=True)
 
 
-# /showplaylist - bonus command to view playlist
-@bot.tree.command(name="showplaylist", description="📜 View the current playlist")
+@bot.tree.command(name="showplaylist", description="View playlists and songs")
 async def showplaylist_cmd(inter):
     if not inter.guild:
         return await inter.response.send_message("Server only.", ephemeral=True)
 
     gid = inter.guild.id
-    pl = get_guild_playlist(gid)
+    gd = get_guild_data(gid)
+
+    if not gd:
+        return await inter.response.send_message(embed=discord.Embed(
+            title=f"{EMOJI_LIST}  No Playlists",
+            description="Use `/addplay` to create one.",
+            color=discord.Color.blurple()))
 
     em = discord.Embed(
-        title="📜 Server Playlist",
-        color=discord.Color.from_rgb(88, 101, 242),
+        title=f"{EMOJI_LIST}  Server Playlists",
+        color=discord.Color.blurple(),
     )
 
-    if not pl:
-        em.description = "*Empty - use `/addplay` to add songs*"
-    else:
-        song_list = ""
-        for i, s in enumerate(pl, 1):
-            song_list += f"`{i}.` 🎵 {s}\n"
-            if i >= 30:
-                remaining = len(pl) - 30
-                if remaining > 0:
-                    song_list += f"\n*...and {remaining} more*"
-                break
-        em.add_field(name=f"🎶 Songs ({len(pl)} total)", value=song_list, inline=False)
+    for name, songs in gd.items():
+        if not songs:
+            em.add_field(name=f"{EMOJI_FOLDER} {name}", value="*Empty*", inline=False)
+            continue
 
-    em.set_footer(text="🎧 /playlist to play • /addplay to add • /delete to remove")
+        lines = [f"`{i}.` {s}" for i, s in enumerate(songs, 1)]
+        if len(lines) > 10:
+            display = lines[:10]
+            display.append(f"*+{len(lines)-10} more...*")
+        else:
+            display = lines
+
+        em.add_field(
+            name=f"{EMOJI_FOLDER} {name}  —  {len(songs)} songs",
+            value="\n".join(display),
+            inline=False,
+        )
+
+    em.set_footer(text=f"{EMOJI_HEADPHONE}  /addplay to add  ·  /delete to remove  ·  /playlist to play")
     await inter.response.send_message(embed=em)
-
 
 # ============================================
 # Start
