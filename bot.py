@@ -1,5 +1,4 @@
 import asyncio
-import hashlib
 import logging
 import os
 import subprocess
@@ -93,21 +92,15 @@ def safe_remove(path):
 
 
 # ============================================
-# COMPLETE download - wait until file is 100% ready
+# Multiple extractor approach to bypass bot detection
 # ============================================
-def search_and_download_complete(query: str):
+def get_ydl_opts(base_path: str, attempt: int = 0):
     """
-    1. Search YouTube
-    2. Download FULLY to disk as MP3
-    3. Verify file is complete and valid
-    4. Return song info only after everything is done
+    Returns different yt-dlp configs for each retry attempt.
+    Each attempt uses different strategies to bypass bot detection.
     """
-    cleanup_cache()
 
-    uid = uuid.uuid4().hex[:12]
-    base = DOWNLOAD_DIR / f"s_{uid}"
-
-    ydl_opts = {
+    common = {
         "format": "bestaudio/best",
         "noplaylist": True,
         "quiet": True,
@@ -116,66 +109,237 @@ def search_and_download_complete(query: str):
         "geo_bypass": True,
         "source_address": "0.0.0.0",
         "socket_timeout": 30,
-        "retries": 5,
-        "fragment_retries": 5,
-        "outtmpl": str(base) + ".%(ext)s",
+        "retries": 3,
+        "fragment_retries": 3,
+        "outtmpl": base_path + ".%(ext)s",
         "postprocessors": [{
             "key": "FFmpegExtractAudio",
             "preferredcodec": "mp3",
             "preferredquality": "192",
         }],
-        "http_headers": {
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/120.0.0.0 Safari/537.36"
-            ),
-        },
-        # Force yt-dlp to wait for postprocessing to finish
         "keepvideo": False,
         "writethumbnail": False,
     }
 
+    if attempt == 0:
+        # Attempt 1: YouTube with PO token workaround
+        common.update({
+            "extractor_args": {
+                "youtube": {
+                    "player_client": ["web", "android"],
+                }
+            },
+            "http_headers": {
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/126.0.0.0 Safari/537.36"
+                ),
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept-Language": "en-US,en;q=0.5",
+                "Accept-Encoding": "gzip, deflate",
+            },
+        })
+    elif attempt == 1:
+        # Attempt 2: YouTube with different client
+        common.update({
+            "extractor_args": {
+                "youtube": {
+                    "player_client": ["mediaconnect"],
+                }
+            },
+            "http_headers": {
+                "User-Agent": (
+                    "Mozilla/5.0 (Linux; Android 14; Pixel 8) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/126.0.0.0 Mobile Safari/537.36"
+                ),
+            },
+        })
+    elif attempt == 2:
+        # Attempt 3: YouTube with tv_embedded client
+        common.update({
+            "extractor_args": {
+                "youtube": {
+                    "player_client": ["tv_embedded"],
+                }
+            },
+            "http_headers": {
+                "User-Agent": (
+                    "Mozilla/5.0 (ChromiumStylePlatform) "
+                    "Cobalt/Version"
+                ),
+            },
+        })
+
+    return common
+
+
+def search_with_fallback(query: str, ydl_opts: dict):
+    """
+    Search using multiple search providers as fallback.
+    If YouTube search fails, try other extractors.
+    """
+
+    search_queries = [
+        f"ytsearch5:{query} audio",
+        f"ytsearch5:{query} official audio",
+        f"ytsearch3:{query}",
+    ]
+
+    for sq in search_queries:
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                sr = ydl.extract_info(sq, download=False)
+                if sr and "entries" in sr:
+                    entries = [e for e in sr["entries"] if e]
+                    if entries:
+                        return entries
+        except Exception:
+            continue
+
+    return None
+
+
+def pick_best_entry(entries: list) -> dict | None:
+    """Pick the best matching entry from search results."""
+    if not entries:
+        return None
+
+    terms = (
+        "official audio", "official video",
+        "official music video", "audio",
+        "lyric video", "full song",
+    )
+
+    for e in entries:
+        tl = (e.get("title") or "").lower()
+        if any(t in tl for t in terms):
+            return e
+
+    return entries[0]
+
+
+def download_entry(url: str, ydl_opts: dict):
+    """Download a specific video URL."""
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            # Step 1: Search
-            sr = ydl.extract_info(
-                f"ytsearch5:{query} official audio",
-                download=False
-            )
-            if not sr or "entries" not in sr:
-                return None
+            return ydl.extract_info(url, download=True)
+    except Exception:
+        return None
 
-            entries = [e for e in sr["entries"] if e]
-            if not entries:
-                return None
 
-            # Pick best match
-            chosen = None
-            terms = (
-                "official audio", "official video",
-                "official music video", "audio",
-                "lyric video", "full song",
-            )
-            for e in entries:
-                tl = (e.get("title") or "").lower()
-                if any(t in tl for t in terms):
-                    chosen = e
-                    break
-            if not chosen:
-                chosen = entries[0]
+def verify_file(path: str) -> bool:
+    """Verify audio file is valid using ffprobe."""
+    try:
+        probe_path = FFMPEG_PATH.replace("ffmpeg", "ffprobe")
+        r = subprocess.run(
+            [probe_path, "-v", "error",
+             "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1",
+             path],
+            capture_output=True, text=True, timeout=10
+        )
+        if r.returncode == 0 and r.stdout.strip():
+            return float(r.stdout.strip()) > 1.0
+    except Exception:
+        pass
 
-            url = chosen.get("webpage_url") or chosen.get("url")
-            if not url:
-                return None
+    try:
+        return Path(path).stat().st_size > 50000
+    except Exception:
+        return False
 
-            # Step 2: Download completely
-            # This call blocks until download AND postprocessing are done
-            info = ydl.extract_info(url, download=True)
-            if not info:
-                return None
 
-        # Step 3: Find the output file
+def parse_song_info(info: dict, file_path: str, file_size: int) -> dict:
+    """Extract clean song info from yt-dlp info dict."""
+    title = info.get("title", "Unknown")
+    uploader = info.get("uploader", "Unknown Artist")
+
+    sn = title
+    an = uploader
+
+    if " - " in title:
+        p = title.split(" - ", 1)
+        sn, an = p[0].strip(), p[1].strip()
+    elif " \u2013 " in title:
+        p = title.split(" \u2013 ", 1)
+        sn, an = p[0].strip(), p[1].strip()
+
+    tags = [
+        "(Official Audio)", "(Official Video)",
+        "(Official Music Video)", "[Official Audio]",
+        "[Official Video]", "(Lyric Video)",
+        "(Audio)", "(HD)", "(Full Song)",
+        "[Full Song]", "(Lyrics)", "[Lyrics]",
+        "(Official)", "[Official]",
+        "(Full Audio)", "[Full Audio]",
+    ]
+    for t in tags:
+        sn = sn.replace(t, "").strip()
+        an = an.replace(t, "").strip()
+
+    thumbs = info.get("thumbnails", [])
+    thumb = thumbs[-1]["url"] if thumbs else None
+    dur = info.get("duration") or 0
+
+    return {
+        "name": sn or title,
+        "artist": an or uploader,
+        "album": "YouTube Music",
+        "duration_sec": dur,
+        "thumbnail": thumb,
+        "file_path": file_path,
+        "file_size": file_size,
+        "title": title,
+    }
+
+
+# ============================================
+# Main download function with multi-attempt retry
+# ============================================
+def search_and_download_complete(query: str):
+    """
+    Multi-attempt download:
+    - Try up to 3 different yt-dlp configurations
+    - Each uses different YouTube client to bypass bot detection
+    - Fully downloads and verifies before returning
+    """
+    cleanup_cache()
+
+    for attempt in range(3):
+        uid = uuid.uuid4().hex[:12]
+        base = DOWNLOAD_DIR / f"s_{uid}"
+        base_str = str(base)
+
+        opts = get_ydl_opts(base_str, attempt)
+
+        # Step 1: Search
+        entries = search_with_fallback(query, {
+            k: v for k, v in opts.items()
+            if k not in ("outtmpl", "postprocessors", "keepvideo", "writethumbnail")
+        })
+
+        if not entries:
+            continue
+
+        chosen = pick_best_entry(entries)
+        if not chosen:
+            continue
+
+        url = chosen.get("webpage_url") or chosen.get("url")
+        if not url:
+            continue
+
+        # Step 2: Download
+        info = download_entry(url, opts)
+        if not info:
+            # Clean any partial files
+            for f in DOWNLOAD_DIR.glob(f"s_{uid}.*"):
+                safe_remove(str(f))
+            continue
+
+        # Step 3: Find downloaded file
         mp3 = base.with_suffix(".mp3")
         found = None
 
@@ -192,91 +356,22 @@ def search_and_download_complete(query: str):
                     break
 
         if not found or not found.exists():
-            return None
+            continue
 
         size = found.stat().st_size
         if size < 10000:
             safe_remove(str(found))
-            return None
+            continue
 
-        # Step 4: Verify file is playable with FFprobe
-        verify_ok = verify_audio_file(str(found))
-        if not verify_ok:
+        # Step 4: Verify
+        if not verify_file(str(found)):
             safe_remove(str(found))
-            return None
+            continue
 
-        # Step 5: Build song info
-        title = info.get("title", "Unknown")
-        uploader = info.get("uploader", "Unknown Artist")
+        # Step 5: Build info
+        return parse_song_info(info, str(found), size)
 
-        sn = title
-        an = uploader
-        if " - " in title:
-            p = title.split(" - ", 1)
-            sn, an = p[0].strip(), p[1].strip()
-        elif " \u2013 " in title:
-            p = title.split(" \u2013 ", 1)
-            sn, an = p[0].strip(), p[1].strip()
-
-        tags = [
-            "(Official Audio)", "(Official Video)",
-            "(Official Music Video)", "[Official Audio]",
-            "[Official Video]", "(Lyric Video)",
-            "(Audio)", "(HD)", "(Full Song)",
-            "[Full Song]", "(Lyrics)", "[Lyrics]",
-            "(Official)", "[Official]",
-            "(Full Audio)", "[Full Audio]",
-        ]
-        for t in tags:
-            sn = sn.replace(t, "").strip()
-            an = an.replace(t, "").strip()
-
-        thumbs = info.get("thumbnails", [])
-        thumb = thumbs[-1]["url"] if thumbs else None
-        dur = info.get("duration") or 0
-
-        return {
-            "name": sn or title,
-            "artist": an or uploader,
-            "album": "YouTube Music",
-            "duration_sec": dur,
-            "thumbnail": thumb,
-            "file_path": str(found),
-            "file_size": size,
-            "title": title,
-        }
-
-    except Exception as e:
-        logger.warning("Download error: %s", e)
-        return None
-
-
-def verify_audio_file(path: str) -> bool:
-    """Use ffprobe to verify the audio file is valid and complete."""
-    try:
-        r = subprocess.run(
-            [
-                FFMPEG_PATH.replace("ffmpeg", "ffprobe"),
-                "-v", "error",
-                "-show_entries", "format=duration",
-                "-of", "default=noprint_wrappers=1:nokey=1",
-                path
-            ],
-            capture_output=True,
-            text=True,
-            timeout=10
-        )
-        if r.returncode == 0 and r.stdout.strip():
-            dur = float(r.stdout.strip())
-            return dur > 1.0
-    except Exception:
-        pass
-
-    # Fallback: if ffprobe not available, check file size
-    try:
-        return Path(path).stat().st_size > 50000
-    except Exception:
-        return False
+    return None
 
 
 # ============================================
@@ -393,15 +488,15 @@ async def on_track_end(gid: int, sid: str, err):
 
 
 # ============================================
-# Audio source from LOCAL file
+# Audio source from local file - CLEAN options
 # ============================================
 def make_source(path: str):
     return discord.PCMVolumeTransformer(
         discord.FFmpegPCMAudio(
             path,
             executable=FFMPEG_PATH,
-            before_options="-nostdin",
-            options="-vn -sn -dn -ar 48000 -ac 2 -b:a 192k"
+            before_options="-nostdin -hide_banner -loglevel error",
+            options="-vn -sn -dn"
         ),
         volume=0.7
     )
@@ -466,7 +561,12 @@ class Controls(discord.ui.View):
 # Modal
 # ============================================
 class SongModal(discord.ui.Modal, title="Play New Song"):
-    inp = discord.ui.TextInput(label="Song Name", placeholder="Enter song name...", required=True, max_length=200)
+    inp = discord.ui.TextInput(
+        label="Song Name",
+        placeholder="Enter song name...",
+        required=True,
+        max_length=200
+    )
 
     def __init__(self, gid):
         super().__init__()
@@ -496,7 +596,6 @@ async def play_song(inter, query: str, vc_channel):
     gid = guild.id
 
     async with get_lock(gid):
-        # Status message
         msg = await inter.followup.send(
             embed=discord.Embed(
                 title="Searching and Processing",
@@ -505,10 +604,8 @@ async def play_song(inter, query: str, vc_channel):
             )
         )
 
-        # Stop old session but keep VC
         await end_session(gid, disconnect=False)
 
-        # Connect to VC
         try:
             cur = guild.voice_client
             if cur and cur.is_connected():
@@ -519,10 +616,11 @@ async def play_song(inter, query: str, vc_channel):
                 vc = await vc_channel.connect(timeout=30.0, self_deaf=True)
         except Exception as e:
             return await safe_edit(msg, embed=discord.Embed(
-                title="Voice Connection Error", description=f"`{e}`", color=discord.Color.red()
+                title="Voice Connection Error",
+                description=f"`{e}`",
+                color=discord.Color.red()
             ))
 
-        # Download COMPLETELY in background thread
         loop = asyncio.get_running_loop()
         song = await loop.run_in_executor(None, search_and_download_complete, query)
 
@@ -533,20 +631,20 @@ async def play_song(inter, query: str, vc_channel):
                 color=discord.Color.red()
             ))
 
-        # Update status
         await safe_edit(msg, embed=discord.Embed(
             title="Starting Playback",
             description=f"**{song['name']}** by {song['artist']}",
             color=discord.Color.blue()
         ))
 
-        # Build audio source from COMPLETED local file
         try:
             source = make_source(song["file_path"])
         except Exception as e:
             safe_remove(song.get("file_path"))
             return await safe_edit(msg, embed=discord.Embed(
-                title="Audio Source Error", description=f"`{e}`", color=discord.Color.red()
+                title="Audio Source Error",
+                description=f"`{e}`",
+                color=discord.Color.red()
             ))
 
         sid = uuid.uuid4().hex
@@ -576,10 +674,11 @@ async def play_song(inter, query: str, vc_channel):
                 music_data.pop(gid, None)
             safe_remove(song.get("file_path"))
             return await safe_edit(msg, embed=discord.Embed(
-                title="Playback Error", description=f"`{e}`", color=discord.Color.red()
+                title="Playback Error",
+                description=f"`{e}`",
+                color=discord.Color.red()
             ))
 
-        # Verify playback started
         await asyncio.sleep(0.8)
         cur = music_data.get(gid)
         if not cur or cur.get("sid") != sid:
@@ -593,15 +692,13 @@ async def play_song(inter, query: str, vc_channel):
                     await vc.disconnect()
             return await safe_edit(msg, embed=discord.Embed(
                 title="Playback Failed",
-                description="File downloaded but playback could not start. Try another song.",
+                description="File downloaded but playback could not start.",
                 color=discord.Color.red()
             ))
 
-        # Show now playing
         view = Controls(song, gid)
         await safe_edit(msg, embed=make_embed(song, gid, "playing"), view=view)
 
-        # Start updater
         bot.loop.create_task(updater(gid, sid, song, view, msg))
 
 
@@ -637,7 +734,10 @@ async def on_ready():
     except Exception as e:
         logger.warning("Sync failed: %s", e)
     await bot.change_presence(
-        activity=discord.Activity(type=discord.ActivityType.listening, name="/song | Music Bot")
+        activity=discord.Activity(
+            type=discord.ActivityType.listening,
+            name="/song | Music Bot"
+        )
     )
 
 
@@ -667,7 +767,10 @@ async def song_cmd(inter, name: str):
         return await inter.response.send_message("Server only.", ephemeral=True)
     if not inter.user.voice or not inter.user.voice.channel:
         return await inter.response.send_message(
-            embed=discord.Embed(title="Join a Voice Channel First", color=discord.Color.red()),
+            embed=discord.Embed(
+                title="Join a Voice Channel First",
+                color=discord.Color.red()
+            ),
             ephemeral=True
         )
     await inter.response.defer(thinking=True)
@@ -684,7 +787,11 @@ async def stop_cmd(inter):
             return await inter.response.send_message("Nothing is playing.", ephemeral=True)
         await end_session(gid, disconnect=True)
         await inter.response.send_message(
-            embed=discord.Embed(title="Stopped", description="Playback stopped.", color=discord.Color.red())
+            embed=discord.Embed(
+                title="Stopped",
+                description="Playback stopped.",
+                color=discord.Color.red()
+            )
         )
 
 
